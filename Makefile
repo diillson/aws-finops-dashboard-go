@@ -8,7 +8,7 @@ DIST_DIR := ./dist
 BINARY_NAME := aws-finops
 
 # Informações da versão
-VERSION := $(shell grep -oP '(?<=Version = ")[^"]+' pkg/version/version.go)
+VERSION := $(shell grep -m1 '^const Version =' pkg/version/version.go | cut -d '"' -f2)
 COMMIT := $(shell git rev-parse --short HEAD)
 BUILD_TIME := $(shell date -u '+%Y-%m-%d_%H:%M:%S')
 
