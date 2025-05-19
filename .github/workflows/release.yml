@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: 1.24
+
+      - name: Build binaries
+        run: |
+          COMMIT=$(git rev-parse HEAD)
+          BUILD_TIME=$(date -u +'%Y-%m-%d %H:%M:%S')
+          LDFLAGS="-X 'github.com/diillson/aws-finops-dashboard-go/pkg/version.Commit=${COMMIT}' -X 'github.com/diillson/aws-finops-dashboard-go/pkg/version.BuildTime=${BUILD_TIME}'"
+          
+          # Build para várias plataformas
+          GOOS=linux GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o aws-finops-linux-amd64 ./cmd/aws-finops/main.go
+          GOOS=darwin GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o aws-finops-darwin-amd64 ./cmd/aws-finops/main.go
+          GOOS=windows GOARCH=amd64 go build -ldflags="${LDFLAGS}" -o aws-finops-windows-amd64.exe ./cmd/aws-finops/main.go
+          
+          # Verifica a versão do binário
+          ./aws-finops-linux-amd64 --version
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            aws-finops-linux-amd64
+            aws-finops-darwin-amd64
+            aws-finops-windows-amd64.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
