@@ -15,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/budgets"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/costexplorer"
 	ceTypes "github.com/aws/aws-sdk-go-v2/service/costexplorer/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -1148,4 +1149,75 @@ func classifyUsageType(usage string) (string, bool) {
 
 	// Caso contrário, não consideramos relevante para "data transfer"
 	return "Other", false
+}
+
+// GetCloudWatchLogGroups lista Log Groups (nome, retenção e tamanho armazenado) por região.
+// RetentionDays = 0 significa "Never expire". Ordenação e top-N são tratadas no usecase/export.
+func (r *AWSRepositoryImpl) GetCloudWatchLogGroups(ctx context.Context, profile string, regions []string) ([]entity.CloudWatchLogGroupInfo, error) {
+	var (
+		mu     sync.Mutex
+		wg     sync.WaitGroup
+		result []entity.CloudWatchLogGroupInfo
+	)
+
+	for _, region := range regions {
+		wg.Add(1)
+		go func(rgn string) {
+			defer wg.Done()
+
+			clientIntf, err := r.getServiceClient(ctx, profile, rgn, "cloudwatchlogs")
+			if err != nil {
+				return
+			}
+			// Se o cliente de cloudwatchlogs não estiver no switch, crie aqui:
+			var cwlClient *cloudwatchlogs.Client
+			switch v := clientIntf.(type) {
+			case *cloudwatchlogs.Client:
+				cwlClient = v
+			default:
+				// Caso o switch não tenha "cloudwatchlogs", criamos aqui como fallback:
+				cfg, cfgErr := r.getAWSConfig(ctx, profile)
+				if cfgErr != nil {
+					return
+				}
+				cfgRegional := cfg.Copy()
+				cfgRegional.Region = rgn
+				cwlClient = cloudwatchlogs.NewFromConfig(cfgRegional)
+			}
+
+			p := cloudwatchlogs.NewDescribeLogGroupsPaginator(cwlClient, &cloudwatchlogs.DescribeLogGroupsInput{
+				Limit: aws.Int32(50),
+			})
+
+			for p.HasMorePages() {
+				page, err := p.NextPage(ctx)
+				if err != nil {
+					return
+				}
+				for _, lg := range page.LogGroups {
+					info := entity.CloudWatchLogGroupInfo{
+						GroupName: aws.ToString(lg.LogGroupName),
+						Region:    rgn,
+						StoredBytes: func(b *int64) int64 {
+							if b == nil {
+								return 0
+							}
+							return *b
+						}(lg.StoredBytes),
+						RetentionDays: func(d *int32) int {
+							if d == nil {
+								return 0
+							}
+							return int(*d)
+						}(lg.RetentionInDays),
+					}
+					mu.Lock()
+					result = append(result, info)
+					mu.Unlock()
+				}
+			}
+		}(region)
+	}
+	wg.Wait()
+	return result, nil
 }

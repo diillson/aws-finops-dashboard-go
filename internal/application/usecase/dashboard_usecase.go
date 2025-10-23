@@ -52,6 +52,10 @@ func (uc *DashboardUseCase) RunDashboard(ctx context.Context, args *types.CLIArg
 		return nil
 	}
 
+	// Ordem dos relatórios
+	if args.LogsAudit {
+		return uc.runCloudWatchLogsAudit(ctx, profileGroups, args)
+	}
 	if args.Audit {
 		return uc.runAuditReport(ctx, profileGroups, args)
 	}
@@ -102,6 +106,176 @@ func (uc *DashboardUseCase) runCostDashboard(ctx context.Context, profileGroups 
 
 	if args.ReportName != "" {
 		uc.exportCostDashboardReports(results, args, prevDates, currDates)
+	}
+
+	return nil
+}
+
+func (uc *DashboardUseCase) runCloudWatchLogsAudit(ctx context.Context, profileGroups []entity.ProfileGroup, args *types.CLIArgs) error {
+	uc.console.LogInfo("Auditing CloudWatch Logs retention...")
+
+	livePrinter, _ := uc.console.GetMultiPrinter().Start()
+	defer livePrinter.Stop()
+
+	type row struct {
+		Profile   string
+		AccountID string
+		Audit     entity.CloudWatchLogsAudit
+		Err       error
+	}
+
+	results := make([]row, 0, len(profileGroups))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, group := range profileGroups {
+		wg.Add(1)
+		go func(g entity.ProfileGroup) {
+			defer wg.Done()
+
+			// Uma barra por perfil: 2 passos (List regions + Fetch logs)
+			bar := uc.console.NewProgressbar(2, fmt.Sprintf("Logs Audit: %s", g.Identifier))
+			bar.Start()
+
+			profile := g.Profiles[0]
+			regions := args.Regions
+			if len(regions) == 0 {
+				rs, _ := uc.awsRepo.GetAccessibleRegions(ctx, profile)
+				regions = rs
+			}
+			bar.Increment()
+
+			logGroups, err := uc.awsRepo.GetCloudWatchLogGroups(ctx, profile, regions)
+			if err != nil {
+				mu.Lock()
+				results = append(results, row{Profile: g.Identifier, Err: err})
+				mu.Unlock()
+				bar.Increment()
+				return
+			}
+			bar.Increment()
+
+			// Filtra grupos sem retenção e ordena por tamanho desc
+			noRetention := make([]entity.CloudWatchLogGroupInfo, 0, len(logGroups))
+			var totalBytes int64
+			for _, lg := range logGroups {
+				totalBytes += lg.StoredBytes
+				if lg.RetentionDays == 0 {
+					noRetention = append(noRetention, lg)
+				}
+			}
+			sort.Slice(noRetention, func(i, j int) bool {
+				return noRetention[i].StoredBytes > noRetention[j].StoredBytes
+			})
+
+			// Top N mais pesados
+			const topN = 10
+			top := noRetention
+			if len(noRetention) > topN {
+				top = noRetention[:topN]
+			}
+
+			accountID, _ := uc.awsRepo.GetAccountID(ctx, profile)
+			audit := entity.CloudWatchLogsAudit{
+				Profile:            g.Identifier,
+				AccountID:          accountID,
+				NoRetentionCount:   len(noRetention),
+				NoRetentionTopN:    top,
+				TotalStoredGB:      float64(totalBytes) / (1024.0 * 1024.0 * 1024.0),
+				RecommendedMessage: "Set retention days per environment (e.g., 7/14/30) to avoid unlimited storage growth.",
+			}
+
+			mu.Lock()
+			results = append(results, row{
+				Profile:   g.Identifier,
+				AccountID: accountID,
+				Audit:     audit,
+			})
+			mu.Unlock()
+		}(group)
+	}
+	wg.Wait()
+
+	// Ordena por perfil
+	sort.Slice(results, func(i, j int) bool { return results[i].Profile < results[j].Profile })
+
+	// Monta a tabela
+	table := uc.console.CreateTable()
+	table.AddColumn("Profile")
+	table.AddColumn("Account ID")
+	table.AddColumn("No Retention (count)")
+	table.AddColumn("Total Stored (GB)")
+	table.AddColumn("Top No-Retention Groups (Region | Name | GB)")
+
+	for _, r := range results {
+		if r.Err != nil {
+			table.AddRow(
+				pterm.FgMagenta.Sprint(r.Profile),
+				"N/A",
+				"N/A",
+				pterm.FgRed.Sprintf("Error: %v", r.Err),
+				"-",
+			)
+			continue
+		}
+		var lines []string
+		limit := len(r.Audit.NoRetentionTopN)
+		if limit > 5 {
+			limit = 5
+		}
+		for i := 0; i < limit; i++ {
+			lg := r.Audit.NoRetentionTopN[i]
+			gb := float64(lg.StoredBytes) / (1024.0 * 1024.0 * 1024.0)
+			lines = append(lines, fmt.Sprintf("%s | %s | %.2f GB", lg.Region, lg.GroupName, gb))
+		}
+		if len(r.Audit.NoRetentionTopN) > limit {
+			lines = append(lines, fmt.Sprintf("... (+%d more)", len(r.Audit.NoRetentionTopN)-limit))
+		}
+
+		table.AddRow(
+			pterm.FgMagenta.Sprint(r.Profile),
+			r.AccountID,
+			fmt.Sprintf("%d", r.Audit.NoRetentionCount),
+			fmt.Sprintf("%.2f", r.Audit.TotalStoredGB),
+			strings.Join(lines, "\n"),
+		)
+	}
+	uc.console.Println("\n" + table.Render())
+
+	// Export
+	if args.ReportName != "" {
+		uc.console.LogInfo("Exporting CloudWatch Logs audit reports...")
+		audits := make([]entity.CloudWatchLogsAudit, 0, len(results))
+		for _, r := range results {
+			if r.Err == nil {
+				audits = append(audits, r.Audit)
+			}
+		}
+		for _, reportType := range args.ReportType {
+			switch strings.ToLower(reportType) {
+			case "csv":
+				path, err := uc.exportRepo.ExportLogsAuditToCSV(audits, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export logs audit CSV: %v", err)
+				} else {
+					uc.console.LogSuccess("Logs audit CSV saved to: %s", path)
+				}
+			case "json":
+				path, err := uc.exportRepo.ExportLogsAuditToJSON(audits, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export logs audit JSON: %v", err)
+				} else {
+					uc.console.LogSuccess("Logs audit JSON saved to: %s", path)
+				}
+			case "pdf":
+				path, err := uc.exportRepo.ExportLogsAuditToPDF(audits, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export logs audit PDF: %v", err)
+				} else {
+					uc.console.LogSuccess("Logs audit PDF saved to: %s", path)
+				}
+			}
+		}
 	}
 
 	return nil
@@ -285,12 +459,8 @@ func (uc *DashboardUseCase) generateDashboardData(ctx context.Context, profileGr
 	jobs := make(chan profileJob, numJobs)
 	results := make(chan entity.ProfileData, numJobs)
 
-	// --- INÍCIO DA CORREÇÃO DEFINITIVA ---
-	// 1. Inicia o MultiPrinter.
 	livePrinter, _ := uc.console.GetMultiPrinter().Start()
-	// 2. Garante que ele pare no final.
 	defer livePrinter.Stop()
-	// --- FIM DA CORREÇÃO DEFINITIVA ---
 
 	var wg sync.WaitGroup
 	numWorkers := 10

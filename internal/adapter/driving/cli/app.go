@@ -20,10 +20,7 @@ type CLIApp struct {
 
 // NewCLIApp cria uma nova aplicação CLI.
 func NewCLIApp(versionStr string) *CLIApp {
-	app := &CLIApp{
-		version: versionStr,
-	}
-
+	app := &CLIApp{version: versionStr}
 	formattedVersion := version.FormatVersion()
 
 	rootCmd := &cobra.Command{
@@ -32,7 +29,6 @@ func NewCLIApp(versionStr string) *CLIApp {
 		Version: formattedVersion,
 		RunE:    app.runCommand,
 	}
-
 	rootCmd.SetVersionTemplate(`{{printf "AWS FinOps Dashboard version: %s\n" .Version}}`)
 
 	rootCmd.PersistentFlags().StringP("config-file", "C", "", "Path to a TOML, YAML, or JSON configuration file")
@@ -49,6 +45,7 @@ func NewCLIApp(versionStr string) *CLIApp {
 	rootCmd.PersistentFlags().Bool("audit", false, "Display an audit report with potential cost savings")
 	rootCmd.PersistentFlags().Bool("breakdown-costs", false, "Show a detailed cost breakdown for services like Data Transfer.")
 	rootCmd.PersistentFlags().Bool("transfer", false, "Display a Data Transfer Deep Dive report")
+	rootCmd.PersistentFlags().Bool("logs-audit", false, "Display a CloudWatch Logs Retention Audit report") // <-- NOVO
 
 	app.rootCmd = rootCmd
 	return app
@@ -74,7 +71,8 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 	trend, _ := app.rootCmd.Flags().GetBool("trend")
 	audit, _ := app.rootCmd.Flags().GetBool("audit")
 	breakdownCosts, _ := app.rootCmd.Flags().GetBool("breakdown-costs")
-	transfer, _ := app.rootCmd.Flags().GetBool("transfer") // <-- NOVO
+	transfer, _ := app.rootCmd.Flags().GetBool("transfer")
+	logsAudit, _ := app.rootCmd.Flags().GetBool("logs-audit") // <-- NOVO
 
 	if dir == "" {
 		cwd, err := os.Getwd()
@@ -110,8 +108,8 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 		Audit:          audit,
 		BreakdownCosts: breakdownCosts,
 		Transfer:       transfer,
+		LogsAudit:      logsAudit,
 	}
-
 	return args, nil
 }
 

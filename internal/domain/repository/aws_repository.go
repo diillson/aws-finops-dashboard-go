@@ -36,4 +36,7 @@ type AWSRepository interface {
 
 	// Data Transfer Deep Dive
 	GetDataTransferBreakdown(ctx context.Context, profile string, timeRange *int, tags []string) (entity.DataTransferReport, error)
+
+	// CloudWatch Logs Retention Audit
+	GetCloudWatchLogGroups(ctx context.Context, profile string, regions []string) ([]entity.CloudWatchLogGroupInfo, error)
 }

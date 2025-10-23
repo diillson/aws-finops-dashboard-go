@@ -590,3 +590,148 @@ func (r *ExportRepositoryImpl) ExportTransferReportToPDF(reports []entity.DataTr
 	}
 	return filepath.Abs(outputFilename)
 }
+
+func (r *ExportRepositoryImpl) ExportLogsAuditToCSV(audits []entity.CloudWatchLogsAudit, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "csv")
+	if err != nil {
+		return "", err
+	}
+
+	f, err := os.Create(outputFilename)
+	if err != nil {
+		return "", fmt.Errorf("error creating logs audit CSV file: %w", err)
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	headers := []string{
+		"Profile", "Account ID", "No Retention (count)", "Total Stored (GB)", "Top No-Retention Groups",
+	}
+	if err := w.Write(headers); err != nil {
+		return "", fmt.Errorf("error writing CSV header: %w", err)
+	}
+
+	for _, a := range audits {
+		var top []string
+		for _, lg := range a.NoRetentionTopN {
+			gb := float64(lg.StoredBytes) / (1024.0 * 1024.0 * 1024.0)
+			top = append(top, fmt.Sprintf("%s | %s | %.2f GB", lg.Region, lg.GroupName, gb))
+		}
+		record := []string{
+			a.Profile,
+			a.AccountID,
+			fmt.Sprintf("%d", a.NoRetentionCount),
+			fmt.Sprintf("%.2f", a.TotalStoredGB),
+			cleanRichTags(strings.Join(top, "\n")),
+		}
+		if err := w.Write(record); err != nil {
+			return "", fmt.Errorf("error writing CSV record: %w", err)
+		}
+	}
+	return filepath.Abs(outputFilename)
+}
+
+func (r *ExportRepositoryImpl) ExportLogsAuditToJSON(audits []entity.CloudWatchLogsAudit, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "json")
+	if err != nil {
+		return "", err
+	}
+
+	f, err := os.Create(outputFilename)
+	if err != nil {
+		return "", fmt.Errorf("error creating logs audit JSON file: %w", err)
+	}
+	defer f.Close()
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(audits); err != nil {
+		return "", fmt.Errorf("error encoding logs audit JSON: %w", err)
+	}
+	return filepath.Abs(outputFilename)
+}
+
+func (r *ExportRepositoryImpl) ExportLogsAuditToPDF(audits []entity.CloudWatchLogsAudit, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "pdf")
+	if err != nil {
+		return "", err
+	}
+
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	tr := pdf.UnicodeTranslatorFromDescriptor("")
+
+	for i, a := range audits {
+		pdf.AddPage()
+		headerColor := [3]int{51, 51, 51}
+		headerTextColor := [3]int{255, 255, 255}
+		sectionTitleColor := [3]int{0, 0, 0}
+		bodyTextColor := [3]int{50, 50, 50}
+		lineColor := [3]int{200, 200, 200}
+
+		drawSection := func(title string, content string) {
+			content = cleanRichTags(content)
+			if strings.TrimSpace(content) == "" {
+				return
+			}
+			pdf.SetFont("Arial", "B", 12)
+			pdf.SetTextColor(sectionTitleColor[0], sectionTitleColor[1], sectionTitleColor[2])
+			pdf.Cell(0, 8, tr(title))
+			pdf.Ln(7)
+			pdf.SetDrawColor(lineColor[0], lineColor[1], lineColor[2])
+			pdf.Line(pdf.GetX(), pdf.GetY(), pdf.GetX()+190, pdf.GetY())
+			pdf.Ln(4)
+			pdf.SetFont("Arial", "", 10)
+			pdf.SetTextColor(bodyTextColor[0], bodyTextColor[1], bodyTextColor[2])
+			pdf.MultiCell(190, 5, tr(content), "", "L", false)
+			pdf.Ln(8)
+		}
+
+		// Header
+		pdf.SetFillColor(headerColor[0], headerColor[1], headerColor[2])
+		pdf.SetTextColor(headerTextColor[0], headerTextColor[1], headerTextColor[2])
+		pdf.SetFont("Arial", "B", 14)
+		pdf.CellFormat(0, 12, tr("  CloudWatch Logs Retention Audit"), "", 1, "L", true, 0, "")
+		pdf.SetFont("Arial", "", 10)
+		pdf.SetFillColor(240, 240, 240)
+		pdf.SetTextColor(bodyTextColor[0], bodyTextColor[1], bodyTextColor[2])
+		pdf.CellFormat(0, 8, tr(fmt.Sprintf("  Profile: %s", a.Profile)), "", 1, "L", true, 0, "")
+		pdf.CellFormat(0, 8, tr(fmt.Sprintf("  Account ID: %s", a.AccountID)), "", 1, "L", true, 0, "")
+		pdf.Ln(6)
+
+		// Summary
+		summary := fmt.Sprintf("No Retention (count): %d\nTotal Stored (GB): %.2f\n\nRecommendation: %s", a.NoRetentionCount, a.TotalStoredGB, a.RecommendedMessage)
+		drawSection("Summary", summary)
+
+		// Top Groups
+		if len(a.NoRetentionTopN) > 0 {
+			var b strings.Builder
+			limit := len(a.NoRetentionTopN)
+			if limit > 20 {
+				limit = 20
+			}
+			for j := 0; j < limit; j++ {
+				lg := a.NoRetentionTopN[j]
+				gb := float64(lg.StoredBytes) / (1024.0 * 1024.0 * 1024.0)
+				b.WriteString(fmt.Sprintf("%s | %s | %.2f GB\n", lg.Region, lg.GroupName, gb))
+			}
+			if len(a.NoRetentionTopN) > limit {
+				b.WriteString(fmt.Sprintf("... (+%d more)\n", len(a.NoRetentionTopN)-limit))
+			}
+			drawSection("Top No-Retention Log Groups", b.String())
+		}
+
+		// Footer
+		pdf.SetY(-15)
+		pdf.SetFont("Arial", "I", 8)
+		pdf.SetTextColor(128, 128, 128)
+		pdf.CellFormat(0, 10, tr(fmt.Sprintf("CloudWatch Logs Audit | %s", time.Now().Format("2006-01-02"))), "", 0, "L", false, 0, "")
+		pdf.CellFormat(0, 10, tr(fmt.Sprintf("Page %d", i+1)), "", 0, "R", false, 0, "")
+	}
+
+	if err := pdf.OutputFileAndClose(outputFilename); err != nil {
+		return "", fmt.Errorf("error writing logs audit PDF file: %w", err)
+	}
+	return filepath.Abs(outputFilename)
+}
