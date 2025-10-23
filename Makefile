@@ -4,16 +4,18 @@
 BIN_DIR := ./bin
 DIST_DIR := ./dist
 
-# Nome do executável
 BINARY_NAME := aws-finops
-
-# Informações da versão
-VERSION := $(shell grep -m1 '^const Version =' pkg/version/version.go | cut -d '"' -f2)
-COMMIT := $(shell git rev-parse --short HEAD)
-BUILD_TIME := $(shell date -u '+%Y-%m-%d_%H:%M:%S')
+VERSION     ?= $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
+ifeq ($(VERSION),)
+  VERSION := 0.0.0-dev
+endif
+COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo development)
+BUILD_TIME       := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+PKG        := github.com/diillson/aws-finops-dashboard-go/pkg/version
+LDFLAGS    := -s -w -X $(PKG).Version=$(VERSION) -X $(PKG).Commit=$(COMMIT) -X $(PKG).BuildTime=$(DATE)
 
 # Go flags
-GO_FLAGS := -ldflags "-X github.com/diillson/aws-finops-dashboard-go/pkg/version.Commit=$(COMMIT) -X github.com/diillson/aws-finops-dashboard-go/pkg/version.BuildTime=$(BUILD_TIME)"
+GO_FLAGS := -ldflags "$(LDFLAGS)"
 
 .PHONY: all build release clean test lint fmt help install uninstall
 

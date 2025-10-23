@@ -1,15 +1,326 @@
-## Funcionamento Detalhado da CLI do AWS FinOps Dashboard
-# AWS FinOps Dashboard CLI
+# AWS FinOps Dashboard (Go) — CLI
 
-### Prerequisitos
-- Go 1.24 ou superior
+Uma CLI para visualizar e auditar custos na AWS (FinOps), com suporte a múltiplos perfis, combinação por conta, exportação de relatórios (CSV/JSON/PDF), análise de tendências e auditoria de otimizações (NAT Gateways caros, LBs ociosos, Volumes/EIPs sem uso, recursos sem tags etc.).
+
+---
+
+## Sumário
+- [Recursos (Features)](#recursos-features)
+- [Pré-requisitos](#pré-requisitos)
+- [Instalação e Build](#instalação-e-build)
+  - [Build com versão correta (ldflags)](#build-com-versão-correta-ldflags)
+  - [Makefile (opcional)](#makefile-opcional)
+- [Uso rápido](#uso-rápido)
+- [Flags da CLI](#flags-da-cli)
+- [Arquivo de configuração (TOML/YAML/JSON)](#arquivo-de-configuração-tomlyamljson)
+  - [Estrutura](#estrutura)
+  - [Exemplos](#exemplos)
+  - [Como usar e precedência](#como-usar-e-precedência)
+- [Casos de Uso (Exemplos práticos)](#casos-de-uso-exemplos-práticos)
+- [Relatórios e Exportação](#relatórios-e-exportação)
+- [Fluxo interno e Arquitetura](#fluxo-interno-e-arquitetura)
+- [Permissões AWS necessárias](#permissões-aws-necessárias)
+- [Solução de problemas (Troubleshooting)](#solução-de-problemas-troubleshooting)
+- [Observações de desempenho](#observações-de-desempenho)
+- [Segurança](#segurança)
+- [Screenshots](#screenshots)
+- [Licença e Créditos](#licença-e-créditos)
+
+---
+
+## Recursos (Features)
+
+- Dashboard de custos por perfil/conta com:
+  - Custo do período anterior vs atual e variação percentual
+  - Custos por serviço, com detalhamento opcional (usage-type) para serviços como Data Transfer, EC2-Other e VPC
+  - Sumário de instâncias EC2 por estado
+  - Status de Budgets (limite, atual, forecast)
+- Combinação por conta com `--combine`
+- Filtros por tags de alocação (`--tag`)
+- Período personalizável (`--time-range`)
+- Análise de tendências (últimos 6 meses) com `--trend`
+- Auditoria de otimização (`--audit`):
+  - NAT Gateways com alto custo
+  - Load Balancers ociosos
+  - Volumes EBS e EIPs sem uso
+  - EC2 paradas
+  - Recursos sem tags (EC2, RDS, Lambda)
+  - VPC Endpoints (Interface) sem uso
+  - Alertas de Budget
+- Exportação: CSV, JSON e PDF
+- Configurações via TOML, YAML ou JSON
+- Verificação de atualização via GitHub Releases
+- Interface rica no terminal (pterm): banner, progress bar, tabelas etc.
+
+---
+
+## Pré-requisitos
+
+- Go **1.24+** (recomendado)
 - AWS CLI configurado com credenciais válidas
-- Acesso à AWS Cost Explorer API
-- Permissões adequadas para acessar os dados de custo e instâncias EC2
+- **Cost Explorer** habilitado
+- Permissões de IAM adequadas ([ver abaixo](#permissões-aws-necessárias))
 
+---
 
-### AWS credentials com permissões:
-```text
+## Instalação e Build
+
+Clone o repositório:
+
+```bash
+git clone https://github.com/diillson/aws-finops-dashboard-go.git
+cd aws-finops-dashboard-go
+````
+
+Build básico:
+
+```bash
+go build -o bin/aws-finops ./cmd/aws-finops
+```
+
+Executável:
+
+```bash
+./bin/aws-finops --help
+```
+
+### Build com versão correta (ldflags)
+
+Linux/macOS:
+
+```bash
+go build -ldflags "-s -w \
+  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.Version=1.2.0 \
+  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.Commit=$(git rev-parse --short HEAD) \
+  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -o bin/aws-finops ./cmd/aws-finops
+```
+
+Windows (PowerShell):
+
+```powershell
+$commit = git rev-parse --short HEAD
+$buildTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+go build -ldflags "-s -w `
+  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.Version=1.2.3 `
+  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.Commit=$commit `
+  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.BuildTime=$buildTime" `
+  -o bin/aws-finops ./cmd/aws-finops
+```
+
+Ao iniciar, verá algo como:
+
+```
+AWS FinOps Dashboard CLI (v1.2.0 (commit: abc1234, built at: 2025-10-23T10:20:30Z))
+```
+
+Sem `-ldflags`, o padrão é:
+
+```
+AWS FinOps Dashboard CLI (v0.0.0-dev (development))
+```
+
+---
+
+### Makefile (opcional)
+
+O projeto inclui um Makefile para simplificar o build.
+
+Uso:
+
+```bash
+make build
+./bin/aws-finops --version
+```
+
+---
+
+## Uso rápido
+
+```bash
+aws-finops --help
+aws-finops --version
+aws-finops -p my-prod
+aws-finops --all
+aws-finops --all --combine
+aws-finops -p prod -g Environment=Production -n finops-report -y csv -y pdf -d ./reports
+aws-finops -p prod --trend
+aws-finops --all --audit -n audit-$(date +%Y%m%d) -y pdf -d ./audits
+```
+
+---
+
+## Flags da CLI
+
+```
+-C, --config-file string   Caminho do arquivo de configuração
+-p, --profiles strings     Perfis AWS (separados por vírgula)
+-r, --regions strings      Regiões AWS
+-a, --all                  Usa todos os perfis disponíveis
+-c, --combine              Combina perfis da mesma conta
+-n, --report-name string   Nome base do relatório
+-y, --report-type strings  Tipos: csv, json, pdf
+-d, --dir string           Diretório de saída
+-t, --time-range int       Intervalo em dias (padrão: mês corrente)
+-g, --tag strings          Filtro por tag (ex: Team=DevOps)
+--trend                    Análise de tendência (6 meses)
+--audit                    Auditoria de otimização
+--breakdown-costs          Detalhamento de custos (usage-type)
+--version                  Mostra a versão
+--help                     Ajuda
+```
+
+---
+
+## Arquivo de configuração (TOML/YAML/JSON)
+
+### Estrutura
+
+```go
+type Config struct {
+  Profiles   []string `json:"profiles" yaml:"profiles" toml:"profiles"`
+  Regions    []string `json:"regions" yaml:"regions" toml:"regions"`
+  Combine    bool     `json:"combine" yaml:"combine" toml:"combine"`
+  ReportName string   `json:"report_name" yaml:"report_name" toml:"report_name"`
+  ReportType []string `json:"report_type" yaml:"report_type" toml:"report_type"`
+  Dir        string   `json:"dir" yaml:"dir" toml:"dir"`
+  TimeRange  int      `json:"time_range" yaml:"time_range" toml:"time_range"`
+  Tag        []string `json:"tag" yaml:"tag" toml:"tag"`
+  Audit      bool     `json:"audit" yaml:"audit" toml:"audit"`
+  Trend      bool     `json:"trend" yaml:"trend" toml:"trend"`
+  All        bool     `json:"all" yaml:"all" toml:"all"`
+}
+```
+
+### Exemplos
+
+**TOML**
+
+```toml
+profiles = ["production", "development", "data-warehouse"]
+regions = ["us-east-1", "us-west-2", "eu-central-1"]
+combine = true
+report_name = "aws-finops-monthly"
+report_type = ["csv", "pdf"]
+dir = "/home/user/reports/aws"
+time_range = 30
+tag = ["Environment=Production", "Department=IT"]
+audit = false
+trend = false
+```
+
+**YAML**
+
+```yaml
+profiles:
+  - production
+  - development
+  - data-warehouse
+regions:
+  - us-east-1
+  - us-west-2
+  - eu-central-1
+combine: true
+report_name: aws-finops-monthly
+report_type: [csv, pdf]
+dir: /home/user/reports/aws
+time_range: 30
+tag: ["Environment=Production", "Department=IT"]
+audit: false
+trend: false
+```
+
+**JSON**
+
+```json
+{
+  "profiles": ["production", "development", "data-warehouse"],
+  "regions": ["us-east-1", "us-west-2", "eu-central-1"],
+  "combine": true,
+  "report_name": "aws-finops-monthly",
+  "report_type": ["csv", "pdf"],
+  "dir": "/home/user/reports/aws",
+  "time_range": 30,
+  "tag": ["Environment=Production", "Department=IT"],
+  "audit": false,
+  "trend": false
+}
+```
+
+### Como usar e precedência
+
+```bash
+aws-finops --config-file /path/config.yaml
+```
+
+Flags de linha de comando **sobrescrevem** as do arquivo.
+
+---
+
+## Casos de Uso (Exemplos práticos)
+
+```bash
+aws-finops --all --combine -n monthly-costs -y csv -y pdf -d ./reports
+aws-finops -p prod -p staging --audit -r us-east-1 -r eu-west-1 -n audit-jan -y pdf -d ./audits
+aws-finops -p prod --trend -g Department=Engineering -t 180
+aws-finops -p prod --breakdown-costs -n finops-dt -y json -y pdf -d ./reports
+aws-finops -C config.yaml --report-name override --trend
+```
+
+---
+
+## Relatórios e Exportação
+
+* Tipos suportados: `csv`, `json`, `pdf`
+* Dashboard:
+
+    * Colunas: Conta, períodos, custos por serviço, Budget, EC2
+* Auditoria:
+
+    * Colunas: Conta, Budget, NAT Gateway, EBS, EC2, LBs, Tags
+* Exemplo:
+
+```bash
+aws-finops -p prod -n report-name -y csv -y json -y pdf -d ./out
+```
+
+---
+
+## Fluxo interno e Arquitetura
+
+**Arquitetura Hexagonal (Ports & Adapters):**
+
+* Domain: entidades e interfaces
+* Application: casos de uso
+* Adapters:
+
+    * driven: AWS SDK, exportação, config
+    * driving: CLI (cobra)
+
+**Principais componentes:**
+
+* `cmd/aws-finops/main.go`
+* `internal/adapter/driving/cli`
+* `internal/application/usecase`
+* `internal/adapter/driven/aws`
+* `pkg/console`
+* `pkg/version`
+
+Fluxo:
+
+1. Inicializa CLI e casos de uso
+2. Lê config/flags
+3. Executa dashboard/auditoria/tendência
+4. Exibe no terminal e exporta relatórios
+5. Verifica atualização (ignorada em `-dev`)
+
+---
+
+## Permissões AWS necessárias
+
+**Dashboard e tendência:**
+
+```
 ce:GetCostAndUsage
 budgets:DescribeBudgets
 ec2:DescribeInstances
@@ -17,539 +328,74 @@ ec2:DescribeRegions
 sts:GetCallerIdentity
 ```
 
-### AWS credentials com permissões (para executar Audit report):
-```text
-ec2:DescribeInstances
+**Auditoria:**
+
+```
 ec2:DescribeVolumes
 ec2:DescribeAddresses
-budgets:DescribeBudgets
-resourcegroupstaggingapi:GetResources
-ec2:DescribeRegions
-````
-
-### Instalação
-```bash
-git clone https://github.com/diillson/aws-finops-dashboard-go.git
-
-cd aws-finops-dashboard-go
-
-make build
+rds:DescribeDBInstances
+lambda:ListFunctions
+elasticloadbalancing:DescribeLoadBalancers
+elasticloadbalancing:DescribeTargetGroups
+elasticloadbalancing:DescribeTargetHealth
 ```
 
-### Executando a CLI
-Após o processo de build, o executável será gerado na pasta bin.
-```path
-./bin/aws-finops
-```
+---
 
-### AWS CLI Profile Setup
-Se você ainda não estiver configurado um perfil, configure seu nome de perfil usando AWS CLI será necessário para executar a CLI do AWS FinOps Dashboard.:
-```text
-aws configure --profile profile1-name
-aws configure --profile profile2-name
-... etc ...
-```
-Repetir para todos os perfil's que desejar usar na CLI.
+## Solução de problemas (Troubleshooting)
 
-Após relizar o build execute o script usando aws-finops com options:
-```bash
-aws-finops [options]
-```
+* `No AWS profiles found`: configure com `aws configure --profile <nome>`
+* `credential validation failed`: renove STS/SSO
+* Cost Explorer vazio: habilite-o na conta
+* `AccessDenied`: ajuste políticas IAM
+* PDF cortado: use JSON/CSV
+* Versão incorreta: use `-ldflags` no build
 
-## 1. Arquitetura Geral
+---
 
-O AWS FinOps Dashboard segue uma arquitetura hexagonal (também conhecida como "portas e adaptadores") que separa claramente as responsabilidades:
+## Observações de desempenho
 
-### Principais Camadas:
+* Processamento concorrente com worker pool
+* Feedback visual com `pterm.MultiPrinter`
+* Cache de clientes AWS
+* `--combine` reduz chamadas redundantes
 
-• Domain: Contém as entidades e contratos de repositórios (interfaces)
-• Application: Contém os casos de uso (lógica de negócio)
-• Adapters: Implementa os repositórios (driven) e interfaces de usuário (driving)
+---
 
-### Componentes Principais:
+## Segurança
 
--  cmd/aws-finops/main.go : Ponto de entrada da aplicação
--  internal/adapter/driving/cli : Implementação da interface de linha de comando
--  internal/application/usecase : Lógica de negócios principal
--  internal/adapter/driven/aws : Implementação do repositório AWS
--  pkg/console : Utilitários para saída no console
+* Sem logging de credenciais
+* Usa perfis padrão da AWS CLI
+* Princípio de menor privilégio
 
-## 2. Fluxo de Execução
+---
 
-### 2.1. Inicialização da Aplicação
+## Screenshots
 
-Quando o comando  aws-finops  é executado:
-
-1. Bootstrap: Em  main.go :
-```go
-   func main() {
-   // Inicializa o aplicativo CLI
-   app := cli.NewCLIApp(version.Version)
-
-   // Inicializa os repositórios
-   awsRepo := aws.NewAWSRepository()
-   exportRepo := export.NewExportRepository()
-   configRepo := config.NewConfigRepository()
-   consoleImpl := console.NewConsole()
-
-   // Inicializa o caso de uso
-   dashboardUseCase := usecase.NewDashboardUseCase(
-   awsRepo,
-   exportRepo,
-   configRepo,
-   consoleImpl,
-   )
-
-   // Define o caso de uso no aplicativo CLI
-   app.SetDashboardUseCase(dashboardUseCase)
-
-   // Executa o aplicativo
-   if err := app.Execute(); err != nil {
-   fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-   os.Exit(1)
-   }
-   }
-```   
-
-2. Criação do CLI App: O  cli.NewCLIApp  inicializa a aplicação CLI usando a biblioteca  cobra :
-```go
-   func NewCLIApp(versionStr string) *CLIApp {
-   app := &CLIApp{
-   version: versionStr,
-   }
-
-   // Configura o comando raiz
-   rootCmd := &cobra.Command{
-   Use:     "aws-finops",
-   Short:   "AWS FinOps Dashboard CLI",
-   Version: formattedVersion,
-   RunE:    app.runCommand,
-   }
-
-   // Adiciona flags e opções de linha de comando
-   rootCmd.PersistentFlags().StringP("config-file", "C", "", "...")
-   rootCmd.PersistentFlags().StringSliceP("profiles", "p", nil, "...")
-   // ... outras flags
-
-   app.rootCmd = rootCmd
-   return app
-   }
-```
-
-### 2.2. Execução do Comando
-
-Quando o comando é executado:
-
-1. Exibição do Banner: O método  displayWelcomeBanner  exibe o banner ASCII colorido e a versão.
-2. Verificação de Versão: A função  checkLatestVersion  é executada em uma goroutine para verificar se há atualizações sem bloquear a aplicação.
-3. Análise de Argumentos: O método  parseArgs  converte os flags da linha de comando para um objeto  CLIArgs .
-4. Execução do Dashboard: O caso de uso principal  dashboardUseCase.RunDashboard  é invocado com os argumentos analisados.
-
-### 2.3. Execução do Caso de Uso  RunDashboard
-
-O método  RunDashboard  do  DashboardUseCase  é o coração da aplicação:
-
-1. Inicialização dos Perfis AWS:
-   profilesToUse, userRegions, timeRange, err := uc.InitializeProfiles(args)
-   Esta etapa determina quais perfis AWS serão usados, com base nas flags  --profiles ,  --all  ou usando o perfil default.
-2. Escolha do Tipo de Relatório:
-   - Se  --audit  for especificado, executa o método  RunAuditReport .
-   - Se  --trend  for especificado, executa o método  RunTrendAnalysis .
-   - Caso contrário, executa o dashboard principal de custos.
-3. Para o Dashboard Principal:
-   - Cria uma tabela para exibição.
-   - Gera os dados para cada perfil AWS.
-   - Exibe a tabela formatada.
-   - Exporta relatórios se a flag  --report-name  for especificada.
-
-
-## 3. Processamento de Perfis AWS
-
-### 3.1. Processamento Individual de Perfil
-
-Para cada perfil AWS especificado, o método  ProcessSingleProfile  ou  ProcessSingleProfileWithProgress :
-
-1. Obtenção de Dados AWS:
-   - Obtém ID da conta AWS.
-   - Obtém dados de custo do Cost Explorer.
-   - Determina regiões acessíveis.
-   - Obtém resumo das instâncias EC2.
-2. Processamento dos Dados:
-   - Processa custos por serviço.
-   - Formata informações de orçamento.
-   - Formata resumo das instâncias EC2.
-   - Calcula alteração percentual no custo total.
-3. Exibição dos Dados:
-   - Adiciona os dados formatados e coloridos à tabela.
-
-
-### 3.2. Processamento Combinado (para a flag  --combine )
-
-Quando a flag  --combine  é usada, os perfis que pertencem à mesma conta AWS são agrupados:
-
-1. Agrupamento por Conta:
-   for _, profile := range profilesToUse {
-   accountID, err := uc.awsRepo.GetAccountID(ctx, profile)
-   accountProfiles[accountID] = append(accountProfiles[accountID], profile)
-   }
-
-2. Processamento por Conta:
-   Para cada conta, processa o perfil primário para obter dados de custo e EC2.
-
-## 4. Tipos de Relatórios
-
-### 4.1. Relatório de Custo (Padrão)
-
-Exibe uma tabela com:
-- Nome do perfil e ID da conta
-- Custo do mês anterior
-- Custo do mês atual com indicação de mudança percentual
-- Custos detalhados por serviço
-- Status do orçamento
-- Resumo das instâncias EC2
-
-
-### 4.2. Relatório de Auditoria (flag  --audit )
-
-Exibe uma tabela com:
-- Nome do perfil e ID da conta
-- Recursos não marcados (untagged)
-- Instâncias EC2 paradas
-- Volumes EBS não utilizados
-- IPs Elásticos não utilizados
-- Alertas de orçamento
-
-
-### 4.3. Análise de Tendência (flag  --trend )
-
-Exibe gráficos de barras mostrando:
-- Tendência de custos mensais por conta/perfil
-- Alteração percentual mês a mês
-- Visualização colorida para indicar aumento/diminuição
-
-
-## 5. Exportação de Relatórios
-
-Quando a flag  --report-name  é fornecida, a aplicação pode exportar os relatórios em vários formatos:
-
-### 5.1. Formatos Suportados (flag  --report-type ):
-
-- CSV: Tabela em formato de valores separados por vírgulas
-- JSON: Representação estruturada em JSON
-- PDF: Documento PDF formatado com tabelas
-
-### 5.2. Processo de Exportação:
-
-1. Coleta e processa todos os dados.
-2. Converte os dados para o formato especificado.
-3. Salva no diretório especificado ou no diretório atual.
-4. Exibe o caminho do arquivo salvo.
-
-## 6. Interação com a AWS
-
-A interação com a AWS é gerenciada pela implementação do  AWSRepository :
-
-### 6.1. Principais Funcionalidades:
-
-- GetAWSProfiles: Obtém perfis do arquivo de credenciais AWS.
-- GetAccountID: Obtém o ID da conta AWS para um perfil.
-- GetCostData: Obtém dados de custo usando AWS Cost Explorer.
-- GetEC2Summary: Obtém resumo das instâncias EC2.
-- GetBudgets: Obtém informações de orçamento.
-- GetUntaggedResources: Identifica recursos sem tags.
-- GetStoppedInstances: Lista instâncias EC2 paradas.
-- GetUnusedVolumes: Lista volumes EBS não utilizados.
-- GetUnusedEIPs: Lista IPs Elásticos não utilizados.
-
-## 7. Feedbacks Visuais
-
-A CLI fornece vários feedbacks visuais durante a execução:
-
-### 7.1. Elementos Visuais:
-
-- Banner ASCII: Exibido no início.
-- Spinners: Mostrados durante operações de longa duração.
-- Barras de Progresso: Indicam o progresso do processamento.
-- Tabelas Coloridas: Exibem os dados formatados.
-- Códigos de Cores:
-- Verde: Valores positivos ou status bom
-- Amarelo: Avisos ou status neutro
-- Vermelho: Valores negativos ou alertas
-- Magenta: Identificadores de perfil
-- Ciano: Estados de instâncias alternativos
-
-
-## 8. Personalização e Configuração
-
-A CLI pode ser personalizada através de:
-
-### 8.1. Flags de Linha de Comando:
-
-- --profiles, -p: Especifica perfis AWS a serem usados
-- --regions, -r: Regiões AWS a verificar
-- --all, -a: Usa todos os perfis disponíveis
-- --combine, -c: Combina perfis da mesma conta
-- --report-name, -n: Nome do arquivo de relatório
-- --report-type, -y: Tipo de relatório (csv, json, pdf)
-- --dir, -d: Diretório para salvar o relatório
-- --time-range, -t: Intervalo de tempo para dados de custo
-- --tag, -g: Tag de alocação de custo para filtrar recursos
-- --trend: Exibe relatório de tendência
-- --audit: Exibe relatório de auditoria
-
-### 8.2. Arquivo de Configuração:
-
-O AWS FinOps Dashboard suporta configuração via arquivos nos formatos TOML, YAML ou JSON, permitindo automatizar e padronizar as execuções sem precisar especificar os argumentos na linha de comando. Esta seção explica detalhadamente como utilizar esta funcionalidade.
-
-### 8.2.1. Estrutura do Arquivo de Configuração
-    type Config struct {
-        Profiles   []string `json:"profiles" yaml:"profiles" toml:"profiles"`
-        Regions    []string `json:"regions" yaml:"regions" toml:"regions"`
-        Combine    bool     `json:"combine" yaml:"combine" toml:"combine"`
-        ReportName string   `json:"report_name" yaml:"report_name" toml:"report_name"`
-        ReportType []string `json:"report_type" yaml:"report_type" toml:"report_type"`
-        Dir        string   `json:"dir" yaml:"dir" toml:"dir"`
-        TimeRange  int      `json:"time_range" yaml:"time_range" toml:"time_range"`
-        Tag        []string `json:"tag" yaml:"tag" toml:"tag"`
-        Audit      bool     `json:"audit" yaml:"audit" toml:"audit"`
-        Trend      bool     `json:"trend" yaml:"trend" toml:"trend"`
-    }
-
-
-### 8.2.2. Formatos Suportados
-O AWS FinOps Dashboard aceita os seguintes formatos de arquivo de configuração:
-
-- TOML ( .toml ): Tom's Obvious, Minimal Language - formato de configuração legível e minimalista
-- YAML ( .yaml  ou  .yml ): YAML Ain't Markup Language - formato muito utilizado para configurações
-- JSON ( .json ): JavaScript Object Notation - formato de dados compacto e independente de linguagem
-
-
-## 8.2.3 Exemplos de Arquivos de Configuração
-
-### Exemplo em TOML
-
-# config.toml - Configuração para AWS FinOps Dashboard
-```toml    
- # Perfis AWS a analisar
- profiles = ["production", "development", "data-warehouse"]
- 
- # Regiões AWS a verificar (deixe vazio para auto-detecção)
- regions = ["us-east-1", "us-west-2", "eu-central-1"]
- 
- # Combinar perfis da mesma conta
- combine = true
- 
- # Configurações de relatório
- report_name = "aws-finops-monthly"
- report_type = ["csv", "pdf"]
- dir = "/home/user/reports/aws"
- 
- # Período de tempo personalizado (em dias)
- time_range = 30
- 
- # Tags para filtragem de custos
- tag = ["Environment=Production", "Department=IT"]
- 
- # Tipos de relatório especiais
- audit = false
- trend = false
-```
-### Exemplo em YAML
-
-```yaml
- # config.yaml - Configuração para AWS FinOps Dashboard
- 
- # Perfis AWS a analisar
- profiles:
-   - production
-   - development
-   - data-warehouse
- 
- # Regiões AWS a verificar (deixe vazio para auto-detecção)
- regions:
-   - us-east-1
-   - us-west-2
-   - eu-central-1
- 
- # Combinar perfis da mesma conta
- combine: true
- 
- # Configurações de relatório
- report_name: aws-finops-monthly
- report_type:
-   - csv
-   - pdf
- dir: /home/user/reports/aws
- 
- # Período de tempo personalizado (em dias)
- time_range: 30
- 
- # Tags para filtragem de custos
- tag:
-   - Environment=Production
-   - Department=IT
- 
- # Tipos de relatório especiais
- audit: false
- trend: false
-```
-
-### Exemplo em JSON
-```json
-    {
-      "profiles": ["production", "development", "data-warehouse"],
-      "regions": ["us-east-1", "us-west-2", "eu-central-1"],
-      "combine": true,
-      "report_name": "aws-finops-monthly",
-      "report_type": ["csv", "pdf"],
-      "dir": "/home/user/reports/aws",
-      "time_range": 30,
-      "tag": ["Environment=Production", "Department=IT"],
-      "audit": false,
-      "trend": false
-    }
-```
-
-### 8.2.4. Exemplos de Casos de Uso
-## Casos de Uso Específicos
-
-### 1. Geração de Relatórios Mensais Automáticos
-
-    # monthly-reporting.yaml
-    profiles:
-      - all-accounts  # Perfil com acesso a todas as contas via IAM Role
-    combine: true
-    report_name: monthly-aws-costs
-    report_type:
-      - csv
-      - pdf
-    dir: /data/reports/aws/monthly
-
-### 2. Auditoria de Recursos Não Utilizados
-
-    # cost-optimization-audit.toml
-    profiles = ["prod", "staging", "dev"]
-    regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1"]
-    combine = false
-    report_name = "resource-audit"
-    report_type = ["csv", "pdf"]
-    dir = "/data/audits"
-    audit = true
-
-### 3. Análise de Tendência por Departamento
-
-    {
-      "profiles": ["prod-main"],
-      "combine": false,
-      "tag": ["Department=Engineering", "Department=Marketing", "Department=Sales"],
-      "trend": true,
-      "time_range": 180
-    }
-
-### 4. Monitoramento Diário de Custos
-
-    # daily-cost-check.yaml
-    profiles:
-      - production
-    time_range: 7  # Últimos 7 dias
-    regions:
-      - us-east-1
-      - us-west-2
-    report_name: daily-cost-report
-    report_type:
-      - pdf
-    dir: /var/reports/daily
-
-## Como Utilizar o Arquivo de Configuração
-
-Para usar um arquivo de configuração, utilize a flag  -C  ou  --config-file  seguida do caminho para o arquivo:
-
-    aws-finops --config-file /path/to/config.toml
-
-Você também pode sobrescrever qualquer configuração do arquivo via flags de linha de comando, que têm precedência:
-
-    # Usa config.yaml mas substitui o nome do relatório e adiciona trend
-    aws-finops --config-file config.yaml --report-name override-name --trend
-
-## Carregamento Interno do Arquivo de Configuração
-
-O AWS FinOps Dashboard carrega o arquivo de configuração através da função  LoadConfigFile  no  ConfigRepository :
-```go
- func (r *ConfigRepositoryImpl) LoadConfigFile(filePath string) (*types.Config, error) {
-     fileExtension := filepath.Ext(filePath)
-     fileExtension = strings.ToLower(fileExtension)
- 
-     // Verifica se o arquivo existe
-     fileInfo, err := os.Stat(filePath)
-     if err != nil {
-         return nil, fmt.Errorf("error accessing config file: %w", err)
-     }
- 
-     // Lê o arquivo
-     fileData, err := os.ReadFile(filePath)
-     if err != nil {
-         return nil, fmt.Errorf("error reading config file: %w", err)
-     }
- 
-     var config types.Config
- 
-     switch fileExtension {
-     case ".toml":
-         if err := toml.Unmarshal(fileData, &config); err != nil {
-             return nil, fmt.Errorf("error parsing TOML file: %w", err)
-         }
-     case ".yaml", ".yml":
-         if err := yaml.Unmarshal(fileData, &config); err != nil {
-             return nil, fmt.Errorf("error parsing YAML file: %w", err)
-         }
-     case ".json":
-         if err := json.Unmarshal(fileData, &config); err != nil {
-             return nil, fmt.Errorf("error parsing JSON file: %w", err)
-         }
-     default:
-         return nil, fmt.Errorf("unsupported config file format: %s", fileExtension)
-     }
- 
-     return &config, nil
- }
-```
-
-## 9. Tratamento de Erros
-
-A CLI implementa um robusto tratamento de erros em vários níveis:
-
-### 9.1. Principais Estratégias:
-
-- Erros de CLI: Exibidos no stderr com código de saída não-zero.
-- Erros de Acesso AWS: Registrados com mensagens informativas, mas a execução continua para outros perfis.
-- Erros de Exportação: Registrados, mas não impedem a exibição da tabela.
-- Perfis Inválidos: Avisos são exibidos, mas a execução continua com perfis válidos.
-
-## 10. Concluindo
-
-A CLI do AWS FinOps Dashboard é uma ferramenta sofisticada que:
-
-1. Facilita a Visibilidade: Apresenta dados de custos AWS de forma clara e segmentada.
-2. Promove Otimização: Identifica recursos não utilizados e oportunidades de economia.
-3. Suporta Compliance: Audita recursos sem tags e ajuda na governança.
-4. Viabiliza Análise: Apresenta tendências de custo para informar decisões.
-
-Sua arquitetura modular e orientada a interfaces facilita a manutenção, extensão e teste, enquanto a experiência do usuário é enriquecida com feedback visual colorido e interativo.
-
-Esta CLI representa uma implementação prática e útil dos princípios de FinOps aplicados à infraestrutura AWS, permitindo que equipes visualizem, compreendam e otimizem seus gastos na nuvem.
-
-
-## 11. Terminal Ouputs
+**Dashboard**
 
 ![Dashboard](./img/aws-finops-dashboard-go-v1.png)
 
+**Tendência**
+
 ![Trend](./img/aws-finops-dashboard-go-trend.png)
 
-![alt text](img/aws-finops-dashboard-go-audit-report.png)
+**Auditoria**
 
+![Audit](./img/aws-finops-dashboard-go-audit-report.png)
 
-## Licença
+---
 
-This project is a Go implementation inspired by https://github.com/ravikiranvm/aws-finops-dashboard, originally developed in Python by https://github.com/ravikiranvm.
+## Licença e Créditos
 
-Original license: MIT. See LICENSE file for more information.
+Inspirado em:
+
+* [ravikiranvm/aws-finops-dashboard](https://github.com/ravikiranvm/aws-finops-dashboard) (Python)
+
+Licença: **MIT**
+
+Port Go e melhorias:
+
+* [diillson/aws-finops-dashboard-go](https://github.com/diillson/aws-finops-dashboard-go)
+
+Contribuições são bem-vindas — abra issues ou PRs com sugestões 🚀

@@ -8,11 +8,12 @@ import (
 	"time"
 
 	"encoding/json"
+
 	"github.com/pterm/pterm"
 )
 
 // Version é a versão atual do AWS FinOps Dashboard
-const Version = "1.0.0"
+var Version = "1.0.0"
 
 // Commit é o commit do git que gerou este build (definido durante a compilação)
 var Commit = "development"
