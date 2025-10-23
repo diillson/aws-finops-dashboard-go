@@ -493,11 +493,14 @@ func (uc *DashboardUseCase) exportCostDashboardReports(results []entity.ProfileD
 	}
 }
 
+// runAuditReport com progress bars por perfil (MultiPrinter) e sem updates concorrentes no spinner.
 func (uc *DashboardUseCase) runAuditReport(ctx context.Context, profileGroups []entity.ProfileGroup, args *types.CLIArgs) error {
 	uc.console.LogInfo("Preparing your audit report...")
-	status := uc.console.Status("Running audit...")
-	defer status.Stop()
 
+	livePrinter, _ := uc.console.GetMultiPrinter().Start()
+	defer livePrinter.Stop()
+
+	// Tabela do terminal
 	table := uc.console.CreateTable()
 	table.AddColumn("Profile")
 	table.AddColumn("Account ID")
@@ -507,6 +510,7 @@ func (uc *DashboardUseCase) runAuditReport(ctx context.Context, profileGroups []
 	table.AddColumn("Idle Load Balancers")
 	table.AddColumn("Stopped EC2")
 	table.AddColumn("Unused Volumes")
+	table.AddColumn("Unused Elastic IPs")
 	table.AddColumn("Untagged Resources")
 
 	var auditDataList []entity.AuditData
@@ -517,8 +521,13 @@ func (uc *DashboardUseCase) runAuditReport(ctx context.Context, profileGroups []
 		wg.Add(1)
 		go func(g entity.ProfileGroup) {
 			defer wg.Done()
+
+			// Uma barra por perfil (8 etapas)
+			const totalSteps = 8
+			bar := uc.console.NewProgressbar(totalSteps, fmt.Sprintf("Auditing: %s", g.Identifier))
+			bar.Start()
+
 			profile := g.Profiles[0]
-			status.Update(fmt.Sprintf("Auditing profile %s...", profile))
 
 			var timeRange *int
 			if args.TimeRange != nil && *args.TimeRange > 0 {
@@ -530,36 +539,65 @@ func (uc *DashboardUseCase) runAuditReport(ctx context.Context, profileGroups []
 				regions, _ = uc.awsRepo.GetAccessibleRegions(ctx, profile)
 			}
 
-			var natCosts []entity.NatGatewayCost
-			var idleLBs entity.IdleLoadBalancers
-			var stopped entity.StoppedEC2Instances
-			var unusedVols entity.UnusedVolumes
-			var untagged entity.UntaggedResources
-			var unusedEndpoints entity.UnusedVpcEndpoints
-			var budgets []entity.BudgetInfo
+			var (
+				natCosts        []entity.NatGatewayCost
+				idleLBs         entity.IdleLoadBalancers
+				stopped         entity.StoppedEC2Instances
+				unusedVols      entity.UnusedVolumes
+				unusedEIPs      entity.UnusedEIPs
+				untagged        entity.UntaggedResources
+				unusedEndpoints entity.UnusedVpcEndpoints
+				budgets         []entity.BudgetInfo
+			)
 
 			var auditWg sync.WaitGroup
-			auditWg.Add(7) // Aumentar para 7 workers
+			auditWg.Add(totalSteps)
+
 			go func() {
 				defer auditWg.Done()
 				natCosts, _ = uc.awsRepo.GetNatGatewayCost(ctx, profile, timeRange, args.Tag)
+				bar.Increment()
 			}()
-			go func() { defer auditWg.Done(); idleLBs, _ = uc.awsRepo.GetIdleLoadBalancers(ctx, profile, regions) }()
-			go func() { defer auditWg.Done(); stopped, _ = uc.awsRepo.GetStoppedInstances(ctx, profile, regions) }()
-			go func() { defer auditWg.Done(); unusedVols, _ = uc.awsRepo.GetUnusedVolumes(ctx, profile, regions) }()
-			go func() { defer auditWg.Done(); untagged, _ = uc.awsRepo.GetUntaggedResources(ctx, profile, regions) }()
+			go func() {
+				defer auditWg.Done()
+				idleLBs, _ = uc.awsRepo.GetIdleLoadBalancers(ctx, profile, regions)
+				bar.Increment()
+			}()
+			go func() {
+				defer auditWg.Done()
+				stopped, _ = uc.awsRepo.GetStoppedInstances(ctx, profile, regions)
+				bar.Increment()
+			}()
+			go func() {
+				defer auditWg.Done()
+				unusedVols, _ = uc.awsRepo.GetUnusedVolumes(ctx, profile, regions)
+				bar.Increment()
+			}()
+			go func() {
+				defer auditWg.Done()
+				unusedEIPs, _ = uc.awsRepo.GetUnusedEIPs(ctx, profile, regions)
+				bar.Increment()
+			}()
+			go func() {
+				defer auditWg.Done()
+				untagged, _ = uc.awsRepo.GetUntaggedResources(ctx, profile, regions)
+				bar.Increment()
+			}()
 			go func() {
 				defer auditWg.Done()
 				unusedEndpoints, _ = uc.awsRepo.GetUnusedVpcEndpoints(ctx, profile, regions)
+				bar.Increment()
 			}()
-			go func() { defer auditWg.Done(); budgets, _ = uc.awsRepo.GetBudgets(ctx, profile) }()
-			auditWg.Wait()
+			go func() { defer auditWg.Done(); budgets, _ = uc.awsRepo.GetBudgets(ctx, profile); bar.Increment() }()
+
+			auditWg.Wait() // barra chega ao total e some (RemoveWhenDone = true)
 
 			accountID, _ := uc.awsRepo.GetAccountID(ctx, profile)
 			natCostsStr := formatNatGatewayCosts(natCosts)
 			idleLBsStr := formatAuditMap(idleLBs, "Idle Load Balancers")
 			stoppedStr := formatAuditMap(stopped, "Stopped Instances")
 			volsStr := formatAuditMap(unusedVols, "Unused Volumes")
+			eipsStr := formatAuditMap(unusedEIPs, "Unused Elastic IPs")
 			untaggedStr := formatAuditMapForUntagged(untagged)
 			unusedEndpointsStr := formatAuditMap(unusedEndpoints, "Unused VPC Endpoints")
 			alertsStr := formatBudgetAlerts(budgets)
@@ -572,6 +610,7 @@ func (uc *DashboardUseCase) runAuditReport(ctx context.Context, profileGroups []
 				IdleLoadBalancers:  idleLBsStr,
 				StoppedInstances:   stoppedStr,
 				UnusedVolumes:      volsStr,
+				UnusedEIPs:         eipsStr,
 				UntaggedResources:  untaggedStr,
 				UnusedVpcEndpoints: unusedEndpointsStr,
 				BudgetAlerts:       alertsStr,
@@ -580,9 +619,11 @@ func (uc *DashboardUseCase) runAuditReport(ctx context.Context, profileGroups []
 		}(group)
 	}
 	wg.Wait()
-	status.Stop()
 
+	// Ordenação por perfil
 	sort.Slice(auditDataList, func(i, j int) bool { return auditDataList[i].Profile < auditDataList[j].Profile })
+
+	// Escreve a tabela
 	for _, data := range auditDataList {
 		table.AddRow(
 			pterm.FgMagenta.Sprint(data.Profile),
@@ -593,6 +634,7 @@ func (uc *DashboardUseCase) runAuditReport(ctx context.Context, profileGroups []
 			data.IdleLoadBalancers,
 			data.StoppedInstances,
 			data.UnusedVolumes,
+			data.UnusedEIPs,
 			data.UntaggedResources,
 		)
 	}
@@ -649,6 +691,10 @@ func formatNatGatewayCosts(costs []entity.NatGatewayCost) string {
 	return strings.TrimSpace(builder.String())
 }
 
+// Limite “de produção” para não poluir terminal/exports quando há muitos itens.
+const maxItemsPerRegion = 50
+
+// formatAuditMapForUntagged com limite por região e ordenação determinística.
 func formatAuditMapForUntagged(data entity.UntaggedResources) string {
 	var builder strings.Builder
 	hasContent := false
@@ -661,24 +707,37 @@ func formatAuditMapForUntagged(data entity.UntaggedResources) string {
 
 	for _, service := range services {
 		regions := data[service]
-		if len(regions) > 0 {
-			hasContent = true
-			builder.WriteString(pterm.FgYellow.Sprintf("%s:\n", service))
+		if len(regions) == 0 {
+			continue
+		}
+		hasContent = true
+		builder.WriteString(pterm.FgYellow.Sprintf("%s:\n", service))
 
-			regionNames := make([]string, 0, len(regions))
-			for r := range regions {
-				regionNames = append(regionNames, r)
+		regionNames := make([]string, 0, len(regions))
+		for r := range regions {
+			regionNames = append(regionNames, r)
+		}
+		sort.Strings(regionNames)
+
+		for _, region := range regionNames {
+			items := regions[region]
+			if len(items) == 0 {
+				continue
 			}
-			sort.Strings(regionNames)
+			sort.Strings(items)
 
-			for _, region := range regionNames {
-				items := regions[region]
-				if len(items) > 0 {
-					builder.WriteString(pterm.FgCyan.Sprintf("  %s:\n", region))
-					for _, item := range items {
-						builder.WriteString(fmt.Sprintf("    - %s\n", item))
-					}
-				}
+			builder.WriteString(pterm.FgCyan.Sprintf("  %s:\n", region))
+
+			// Aplica limite por região
+			limit := len(items)
+			if limit > maxItemsPerRegion {
+				limit = maxItemsPerRegion
+			}
+			for _, item := range items[:limit] {
+				builder.WriteString(fmt.Sprintf("    - %s\n", item))
+			}
+			if len(items) > limit {
+				builder.WriteString(fmt.Sprintf("    ... (+%d more)\n", len(items)-limit))
 			}
 		}
 	}
@@ -689,14 +748,13 @@ func formatAuditMapForUntagged(data entity.UntaggedResources) string {
 	return builder.String()
 }
 
-// Funções auxiliares para auditoria
+// formatAuditMap genérico (Idle LBs, Stopped, Volumes, EIPs, VPC Endpoints) com limite por região.
 func formatAuditMap[V ~map[string][]string](data V, title string) string {
 	if len(data) == 0 {
 		return "None"
 	}
 	var builder strings.Builder
 
-	// Ordenar regiões para saída consistente
 	regions := make([]string, 0, len(data))
 	for r := range data {
 		regions = append(regions, r)
@@ -705,11 +763,22 @@ func formatAuditMap[V ~map[string][]string](data V, title string) string {
 
 	for _, region := range regions {
 		items := data[region]
-		if len(items) > 0 {
-			builder.WriteString(pterm.FgCyan.Sprintf("%s:\n", region))
-			for _, item := range items {
-				builder.WriteString(fmt.Sprintf("  - %s\n", item))
-			}
+		if len(items) == 0 {
+			continue
+		}
+		sort.Strings(items)
+
+		builder.WriteString(pterm.FgCyan.Sprintf("%s:\n", region))
+
+		limit := len(items)
+		if limit > maxItemsPerRegion {
+			limit = maxItemsPerRegion
+		}
+		for _, item := range items[:limit] {
+			builder.WriteString(fmt.Sprintf("  - %s\n", item))
+		}
+		if len(items) > limit {
+			builder.WriteString(fmt.Sprintf("  ... (+%d more)\n", len(items)-limit))
 		}
 	}
 	return builder.String()

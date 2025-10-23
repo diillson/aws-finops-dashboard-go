@@ -64,6 +64,7 @@ func (r *ExportRepositoryImpl) ExportToCSV(data []entity.ProfileData, filename, 
 			fmt.Sprintf("$%.2f", row.CurrentMonth),
 			strings.TrimSpace(servicesData),
 			strings.Join(row.BudgetInfo, "\n"),
+			// Remove quaisquer códigos ANSI que tenham “sobrado” em strings (por segurança)
 			cleanRichTags(strings.Join(row.EC2SummaryFormatted, "\n")),
 		}
 		writer.Write(record)
@@ -219,7 +220,7 @@ func (r *ExportRepositoryImpl) ExportToPDF(data []entity.ProfileData, filename, 
 	return filepath.Abs(outputFilename)
 }
 
-// --- Funções de Exportação do Relatório de Auditoria (IMPLEMENTADAS) ---
+// --- Funções de Exportação do Relatório de Auditoria ---
 
 func (r *ExportRepositoryImpl) ExportAuditReportToCSV(auditData []entity.AuditData, filename, outputDir string) (string, error) {
 	outputFilename, err := generateFilename(filename, outputDir, "csv")
@@ -237,9 +238,20 @@ func (r *ExportRepositoryImpl) ExportAuditReportToCSV(auditData []entity.AuditDa
 	defer writer.Flush()
 
 	headers := []string{
-		"Profile", "Account ID", "Budget Alerts", "High-Cost NAT Gateways", "Idle Load Balancers", "Stopped EC2 Instances", "Unused EBS Volumes", "Unused Elastic IPs", "Untagged Resources",
+		"Profile",
+		"Account ID",
+		"Budget Alerts",
+		"High-Cost NAT Gateways",
+		"Unused VPC Endpoints",
+		"Idle Load Balancers",
+		"Stopped EC2 Instances",
+		"Unused EBS Volumes",
+		"Unused Elastic IPs",
+		"Untagged Resources",
 	}
-	writer.Write(headers)
+	if err := writer.Write(headers); err != nil {
+		return "", fmt.Errorf("error writing CSV header: %w", err)
+	}
 
 	for _, row := range auditData {
 		record := []string{
@@ -247,13 +259,16 @@ func (r *ExportRepositoryImpl) ExportAuditReportToCSV(auditData []entity.AuditDa
 			row.AccountID,
 			cleanRichTags(row.BudgetAlerts),
 			cleanRichTags(row.NatGatewayCosts),
+			cleanRichTags(row.UnusedVpcEndpoints),
 			cleanRichTags(row.IdleLoadBalancers),
 			cleanRichTags(row.StoppedInstances),
 			cleanRichTags(row.UnusedVolumes),
 			cleanRichTags(row.UnusedEIPs),
 			cleanRichTags(row.UntaggedResources),
 		}
-		writer.Write(record)
+		if err := writer.Write(record); err != nil {
+			return "", fmt.Errorf("error writing CSV record: %w", err)
+		}
 	}
 
 	return filepath.Abs(outputFilename)
@@ -268,15 +283,16 @@ func (r *ExportRepositoryImpl) ExportAuditReportToJSON(auditData []entity.AuditD
 	cleanData := make([]entity.AuditData, len(auditData))
 	for i, row := range auditData {
 		cleanData[i] = entity.AuditData{
-			Profile:           row.Profile,
-			AccountID:         row.AccountID,
-			BudgetAlerts:      cleanRichTags(row.BudgetAlerts),
-			NatGatewayCosts:   cleanRichTags(row.NatGatewayCosts),
-			IdleLoadBalancers: cleanRichTags(row.IdleLoadBalancers),
-			StoppedInstances:  cleanRichTags(row.StoppedInstances),
-			UnusedVolumes:     cleanRichTags(row.UnusedVolumes),
-			UnusedEIPs:        cleanRichTags(row.UnusedEIPs),
-			UntaggedResources: cleanRichTags(row.UntaggedResources), // <-- CAMPO RESTAURADO
+			Profile:            row.Profile,
+			AccountID:          row.AccountID,
+			BudgetAlerts:       cleanRichTags(row.BudgetAlerts),
+			NatGatewayCosts:    cleanRichTags(row.NatGatewayCosts),
+			IdleLoadBalancers:  cleanRichTags(row.IdleLoadBalancers),
+			StoppedInstances:   cleanRichTags(row.StoppedInstances),
+			UnusedVolumes:      cleanRichTags(row.UnusedVolumes),
+			UnusedEIPs:         cleanRichTags(row.UnusedEIPs),
+			UntaggedResources:  cleanRichTags(row.UntaggedResources),
+			UnusedVpcEndpoints: cleanRichTags(row.UnusedVpcEndpoints),
 		}
 	}
 
@@ -319,7 +335,7 @@ func (r *ExportRepositoryImpl) ExportAuditReportToPDF(auditData []entity.AuditDa
 			}
 			pdf.SetFont("Arial", "B", 12)
 			pdf.SetTextColor(sectionTitleColor[0], sectionTitleColor[1], sectionTitleColor[2])
-			pdf.Cell(0, 8, title)
+			pdf.Cell(0, 8, tr(title))
 			pdf.Ln(7)
 
 			pdf.SetDrawColor(lineColor[0], lineColor[1], lineColor[2])
@@ -343,14 +359,15 @@ func (r *ExportRepositoryImpl) ExportAuditReportToPDF(auditData []entity.AuditDa
 		pdf.CellFormat(0, 8, tr(fmt.Sprintf("  Account ID: %s", row.AccountID)), "", 1, "L", true, 0, "")
 		pdf.Ln(10)
 
-		// Seções da Auditoria (em ordem de prioridade)
+		// Seções da Auditoria — ordem consistente com o terminal
 		drawSection("Budget Alerts", row.BudgetAlerts)
 		drawSection("High-Cost NAT Gateways", row.NatGatewayCosts)
+		drawSection("Unused VPC Endpoints", row.UnusedVpcEndpoints)
 		drawSection("Idle Load Balancers", row.IdleLoadBalancers)
 		drawSection("Stopped EC2 Instances", row.StoppedInstances)
 		drawSection("Unused EBS Volumes", row.UnusedVolumes)
 		drawSection("Unused Elastic IPs", row.UnusedEIPs)
-		drawSection("Untagged Resources", row.UntaggedResources) // <-- SEÇÃO RESTAURADA
+		drawSection("Untagged Resources", row.UntaggedResources)
 
 		// Rodapé
 		pdf.SetY(-15)
@@ -387,43 +404,13 @@ func generateFilename(base, dir, ext string) (string, error) {
 	return filepath.Join(dir, filename), nil
 }
 
-// A função auxiliar calculateRowHeight também precisa ser corrigida para a lógica de mesclagem.
-func calculateRowHeight(pdf *gofpdf.Fpdf, data []string, colWidths []float64, usableWidth float64) float64 {
-	maxLines := 0
-	lineHeight := 4.0 // Altura de uma única linha de texto (MultiCell line ht)
-
-	for i, str := range data {
-		var width float64
-		// Lógica de mesclagem para cálculo
-		if i == 0 {
-			width = usableWidth * (colWidths[0] + colWidths[1])
-		} else if i == 1 {
-			continue // Pula o cálculo para a segunda coluna
-		} else {
-			width = usableWidth * colWidths[i]
-		}
-
-		lines := pdf.SplitText(str, width)
-		if len(lines) > maxLines {
-			maxLines = len(lines)
-		}
-	}
-	// Adiciona padding: 2 para cima/baixo
-	return float64(maxLines)*lineHeight + 2.0
-}
-
-// addFooter adiciona um rodapé padronizado ao PDF.
-func addFooter(pdf *gofpdf.Fpdf) {
-	pdf.SetY(-15)
-	pdf.SetFont("Arial", "I", 8)
-	pdf.SetTextColor(128, 128, 128)
-	footerText := fmt.Sprintf("Generated by AWS FinOps Dashboard (Go) on %s", time.Now().Format("2006-01-02 15:04:05"))
-	pdf.CellFormat(0, 10, footerText, "", 0, "C", false, 0, "")
-}
-
-// cleanRichTags remove as tags de formatação da pterm para exportação limpa.
+// Regex para limpar formatação pterm (rich tags) e sequências ANSI de cor/estilo.
 var richTagRegex = regexp.MustCompile(`\[/?([a-zA-Z]+|#[0-9a-fA-F]{6})\]`)
+var ansiRegex = regexp.MustCompile(`\x1B\[[0-9;]*[A-Za-z]`)
 
+// cleanRichTags remove tags de formatação do pterm e sequências ANSI.
 func cleanRichTags(text string) string {
-	return richTagRegex.ReplaceAllString(text, "")
+	text = richTagRegex.ReplaceAllString(text, "")
+	text = ansiRegex.ReplaceAllString(text, "")
+	return text
 }
