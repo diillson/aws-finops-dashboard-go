@@ -65,7 +65,7 @@ func (uc *DashboardUseCase) RunDashboard(ctx context.Context, args *types.CLIArg
 // runCostDashboard executa o dashboard de custos principal.
 func (uc *DashboardUseCase) runCostDashboard(ctx context.Context, profileGroups []entity.ProfileGroup, args *types.CLIArgs) error {
 	status := uc.console.Status("Initializing dashboard...")
-	defer status.Stop()
+	defer status.Stop() // Defer é seguro aqui, pois a impressão da tabela ocorre depois.
 
 	var timeRange *int
 	if args.TimeRange != nil && *args.TimeRange > 0 {
@@ -80,7 +80,12 @@ func (uc *DashboardUseCase) runCostDashboard(ctx context.Context, profileGroups 
 	status.Update("Fetching AWS data concurrently...")
 
 	results := uc.generateDashboardData(ctx, profileGroups, args)
+
+	// Parar o spinner explicitamente aqui garante que ele desapareça
+	// antes de qualquer outra impressão.
 	status.Stop()
+
+	// O MultiPrinter dentro de generateDashboardData já parou e limpou suas linhas.
 
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Profile < results[j].Profile
@@ -90,7 +95,7 @@ func (uc *DashboardUseCase) runCostDashboard(ctx context.Context, profileGroups 
 		uc.addProfileToTable(table, data)
 	}
 
-	uc.console.Print(table.Render())
+	uc.console.Print("\n" + table.Render())
 
 	if args.ReportName != "" {
 		uc.exportCostDashboardReports(results, args, prevDates, currDates)
@@ -158,16 +163,17 @@ func (uc *DashboardUseCase) processProfileJob(ctx context.Context, job profileJo
 	}
 
 	if job.Group.IsCombined {
-		return uc.processCombinedProfile(ctx, job.Group, job.Args.Regions, timeRange, job.Args.Tag, job.ProgressBar)
+		return uc.processCombinedProfile(ctx, job.Group, job.Args.Regions, timeRange, job.Args.Tag, job.Args.BreakdownCosts, job.ProgressBar)
 	}
-	return uc.processSingleProfile(ctx, job.Group.Profiles[0], job.Args.Regions, timeRange, job.Args.Tag, job.ProgressBar)
+	return uc.processSingleProfile(ctx, job.Group.Profiles[0], job.Args.Regions, timeRange, job.Args.Tag, job.Args.BreakdownCosts, job.ProgressBar)
 }
 
-func (uc *DashboardUseCase) processSingleProfile(ctx context.Context, profile string, userRegions []string, timeRange *int, tags []string, progress *pterm.ProgressbarPrinter) entity.ProfileData {
+func (uc *DashboardUseCase) processSingleProfile(ctx context.Context, profile string, userRegions []string, timeRange *int, tags []string, breakdown bool, progress *pterm.ProgressbarPrinter) entity.ProfileData {
 	data := entity.ProfileData{Profile: profile, Success: false}
 	progress.Increment()
 
-	costData, err := uc.awsRepo.GetCostData(ctx, profile, timeRange, tags)
+	// Passa a flag 'breakdown' para o repositório
+	costData, err := uc.awsRepo.GetCostData(ctx, profile, timeRange, tags, breakdown)
 	if err != nil {
 		data.Err = fmt.Errorf("failed to get cost data: %w", err)
 		return data
@@ -193,12 +199,13 @@ func (uc *DashboardUseCase) processSingleProfile(ctx context.Context, profile st
 	return data
 }
 
-func (uc *DashboardUseCase) processCombinedProfile(ctx context.Context, group entity.ProfileGroup, userRegions []string, timeRange *int, tags []string, progress *pterm.ProgressbarPrinter) entity.ProfileData {
+func (uc *DashboardUseCase) processCombinedProfile(ctx context.Context, group entity.ProfileGroup, userRegions []string, timeRange *int, tags []string, breakdown bool, progress *pterm.ProgressbarPrinter) entity.ProfileData {
 	data := entity.ProfileData{Profile: group.Identifier, AccountID: group.AccountID, Success: false}
 	primaryProfile := group.Profiles[0]
 	progress.Increment()
 
-	costData, err := uc.awsRepo.GetCostData(ctx, primaryProfile, timeRange, tags)
+	// Passa a flag 'breakdown' para o repositório
+	costData, err := uc.awsRepo.GetCostData(ctx, primaryProfile, timeRange, tags, breakdown)
 	if err != nil {
 		data.Err = fmt.Errorf("failed to get cost data for account: %w", err)
 		return data
@@ -400,7 +407,8 @@ func (uc *DashboardUseCase) initializeProfiles(ctx context.Context, args *types.
 }
 
 func (uc *DashboardUseCase) getDisplayTablePeriodInfo(ctx context.Context, profile string, timeRange *int) (string, string, string, string) {
-	costData, err := uc.awsRepo.GetCostData(ctx, profile, timeRange, nil)
+	costData, err := uc.awsRepo.GetCostData(ctx, profile, timeRange, nil, false)
+
 	if err == nil {
 		pFormat := "2006-01-02"
 		prevDates := fmt.Sprintf("%s to %s", costData.PreviousPeriodStart.Format(pFormat), costData.PreviousPeriodEnd.Format(pFormat))
@@ -493,11 +501,13 @@ func (uc *DashboardUseCase) runAuditReport(ctx context.Context, profileGroups []
 	table := uc.console.CreateTable()
 	table.AddColumn("Profile")
 	table.AddColumn("Account ID")
+	table.AddColumn("Budget Alerts")
+	table.AddColumn("High-Cost NAT GWs")
+	table.AddColumn("Unused VPC Endpoints")
+	table.AddColumn("Idle Load Balancers")
 	table.AddColumn("Stopped EC2")
 	table.AddColumn("Unused Volumes")
-	table.AddColumn("Unused EIPs")
-	table.AddColumn("Idle Load Balancers")
-	table.AddColumn("Budget Alerts")
+	table.AddColumn("Untagged Resources")
 
 	var auditDataList []entity.AuditData
 	var mu sync.Mutex
@@ -510,44 +520,61 @@ func (uc *DashboardUseCase) runAuditReport(ctx context.Context, profileGroups []
 			profile := g.Profiles[0]
 			status.Update(fmt.Sprintf("Auditing profile %s...", profile))
 
+			var timeRange *int
+			if args.TimeRange != nil && *args.TimeRange > 0 {
+				timeRange = args.TimeRange
+			}
+
 			regions := args.Regions
 			if len(regions) == 0 {
 				regions, _ = uc.awsRepo.GetAccessibleRegions(ctx, profile)
 			}
 
-			// Coleta concorrente dos dados de auditoria
+			var natCosts []entity.NatGatewayCost
+			var idleLBs entity.IdleLoadBalancers
 			var stopped entity.StoppedEC2Instances
 			var unusedVols entity.UnusedVolumes
-			var unusedEIPs entity.UnusedEIPs
-			var idleLBs entity.IdleLoadBalancers
+			var untagged entity.UntaggedResources
+			var unusedEndpoints entity.UnusedVpcEndpoints
 			var budgets []entity.BudgetInfo
 
 			var auditWg sync.WaitGroup
-			auditWg.Add(5)
+			auditWg.Add(7) // Aumentar para 7 workers
+			go func() {
+				defer auditWg.Done()
+				natCosts, _ = uc.awsRepo.GetNatGatewayCost(ctx, profile, timeRange, args.Tag)
+			}()
+			go func() { defer auditWg.Done(); idleLBs, _ = uc.awsRepo.GetIdleLoadBalancers(ctx, profile, regions) }()
 			go func() { defer auditWg.Done(); stopped, _ = uc.awsRepo.GetStoppedInstances(ctx, profile, regions) }()
 			go func() { defer auditWg.Done(); unusedVols, _ = uc.awsRepo.GetUnusedVolumes(ctx, profile, regions) }()
-			go func() { defer auditWg.Done(); unusedEIPs, _ = uc.awsRepo.GetUnusedEIPs(ctx, profile, regions) }()
-			go func() { defer auditWg.Done(); idleLBs, _ = uc.awsRepo.GetIdleLoadBalancers(ctx, profile, regions) }() // <-- NOVA CHAMADA
+			go func() { defer auditWg.Done(); untagged, _ = uc.awsRepo.GetUntaggedResources(ctx, profile, regions) }()
+			go func() {
+				defer auditWg.Done()
+				unusedEndpoints, _ = uc.awsRepo.GetUnusedVpcEndpoints(ctx, profile, regions)
+			}()
 			go func() { defer auditWg.Done(); budgets, _ = uc.awsRepo.GetBudgets(ctx, profile) }()
 			auditWg.Wait()
 
-			// Formatação
 			accountID, _ := uc.awsRepo.GetAccountID(ctx, profile)
+			natCostsStr := formatNatGatewayCosts(natCosts)
+			idleLBsStr := formatAuditMap(idleLBs, "Idle Load Balancers")
 			stoppedStr := formatAuditMap(stopped, "Stopped Instances")
 			volsStr := formatAuditMap(unusedVols, "Unused Volumes")
-			eipsStr := formatAuditMap(unusedEIPs, "Unused EIPs")
-			idleLBsStr := formatAuditMap(idleLBs, "Idle Load Balancers") // <-- NOVA FORMATAÇÃO
+			untaggedStr := formatAuditMapForUntagged(untagged)
+			unusedEndpointsStr := formatAuditMap(unusedEndpoints, "Unused VPC Endpoints")
 			alertsStr := formatBudgetAlerts(budgets)
 
 			mu.Lock()
 			auditDataList = append(auditDataList, entity.AuditData{
-				Profile:           profile,
-				AccountID:         accountID,
-				StoppedInstances:  stoppedStr,
-				UnusedVolumes:     volsStr,
-				UnusedEIPs:        eipsStr,
-				IdleLoadBalancers: idleLBsStr,
-				BudgetAlerts:      alertsStr,
+				Profile:            profile,
+				AccountID:          accountID,
+				NatGatewayCosts:    natCostsStr,
+				IdleLoadBalancers:  idleLBsStr,
+				StoppedInstances:   stoppedStr,
+				UnusedVolumes:      volsStr,
+				UntaggedResources:  untaggedStr,
+				UnusedVpcEndpoints: unusedEndpointsStr,
+				BudgetAlerts:       alertsStr,
 			})
 			mu.Unlock()
 		}(group)
@@ -560,19 +587,106 @@ func (uc *DashboardUseCase) runAuditReport(ctx context.Context, profileGroups []
 		table.AddRow(
 			pterm.FgMagenta.Sprint(data.Profile),
 			data.AccountID,
+			data.BudgetAlerts,
+			data.NatGatewayCosts,
+			data.UnusedVpcEndpoints,
+			data.IdleLoadBalancers,
 			data.StoppedInstances,
 			data.UnusedVolumes,
-			data.UnusedEIPs,
-			data.IdleLoadBalancers,
-			data.BudgetAlerts,
+			data.UntaggedResources,
 		)
 	}
-	uc.console.Print(table.Render())
+	uc.console.Println("\n" + table.Render())
 
-	// A lógica de exportação precisaria ser atualizada para incluir este novo campo.
-	// (Deixado como exercício por enquanto para focar na lógica principal)
+	if args.ReportName != "" {
+		uc.console.LogInfo("Exporting audit reports...")
+		for _, reportType := range args.ReportType {
+			switch strings.ToLower(reportType) {
+			case "csv":
+				path, err := uc.exportRepo.ExportAuditReportToCSV(auditDataList, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export audit report to CSV: %v", err)
+				} else {
+					uc.console.LogSuccess("Audit CSV report saved to: %s", path)
+				}
+			case "json":
+				path, err := uc.exportRepo.ExportAuditReportToJSON(auditDataList, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export audit report to JSON: %v", err)
+				} else {
+					uc.console.LogSuccess("Audit JSON report saved to: %s", path)
+				}
+			case "pdf":
+				path, err := uc.exportRepo.ExportAuditReportToPDF(auditDataList, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export audit report to PDF: %v", err)
+				} else {
+					uc.console.LogSuccess("Audit PDF report saved to: %s", path)
+				}
+			}
+		}
+	}
 
 	return nil
+}
+
+func formatNatGatewayCosts(costs []entity.NatGatewayCost) string {
+	if len(costs) == 0 {
+		return "None"
+	}
+	var builder strings.Builder
+	// Limita a exibição aos 5 mais caros para não poluir a UI
+	limit := 5
+	if len(costs) < limit {
+		limit = len(costs)
+	}
+
+	for i := 0; i < limit; i++ {
+		c := costs[i]
+		builder.WriteString(pterm.FgRed.Sprintf("$%.2f", c.Cost))
+		builder.WriteString(fmt.Sprintf(" - %s (%s)\n", c.ResourceID, c.Region))
+	}
+	return strings.TrimSpace(builder.String())
+}
+
+func formatAuditMapForUntagged(data entity.UntaggedResources) string {
+	var builder strings.Builder
+	hasContent := false
+
+	services := make([]string, 0, len(data))
+	for s := range data {
+		services = append(services, s)
+	}
+	sort.Strings(services)
+
+	for _, service := range services {
+		regions := data[service]
+		if len(regions) > 0 {
+			hasContent = true
+			builder.WriteString(pterm.FgYellow.Sprintf("%s:\n", service))
+
+			regionNames := make([]string, 0, len(regions))
+			for r := range regions {
+				regionNames = append(regionNames, r)
+			}
+			sort.Strings(regionNames)
+
+			for _, region := range regionNames {
+				items := regions[region]
+				if len(items) > 0 {
+					builder.WriteString(pterm.FgCyan.Sprintf("  %s:\n", region))
+					for _, item := range items {
+						builder.WriteString(fmt.Sprintf("    - %s\n", item))
+					}
+				}
+			}
+		}
+	}
+
+	if !hasContent {
+		return "None"
+	}
+	return builder.String()
 }
 
 // Funções auxiliares para auditoria
@@ -659,8 +773,19 @@ func (uc *DashboardUseCase) runTrendAnalysis(ctx context.Context, profileGroups 
 func (uc *DashboardUseCase) formatServiceCosts(costs []entity.ServiceCost) []string {
 	var formatted []string
 	for _, sc := range costs {
-		formatted = append(formatted, fmt.Sprintf("%s: $%.2f", sc.ServiceName, sc.Cost))
+		if len(sc.SubCosts) == 0 {
+			formatted = append(formatted, fmt.Sprintf("%s: $%.2f", sc.ServiceName, sc.Cost))
+			continue
+		}
+
+		// Adiciona a linha principal com um indicador de detalhes
+		formatted = append(formatted, fmt.Sprintf("%s: $%.2f (details below)", sc.ServiceName, sc.Cost))
+		// Adiciona os sub-custos com indentação
+		for _, sub := range sc.SubCosts {
+			formatted = append(formatted, pterm.FgGray.Sprintf("  └─ %s: $%.2f", sub.ServiceName, sub.Cost))
+		}
 	}
+
 	if len(formatted) == 0 {
 		return []string{"No costs found"}
 	}

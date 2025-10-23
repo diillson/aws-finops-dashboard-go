@@ -5,10 +5,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/diillson/aws-finops-dashboard-go/pkg/version"
-
 	"github.com/diillson/aws-finops-dashboard-go/internal/application/usecase"
 	"github.com/diillson/aws-finops-dashboard-go/internal/shared/types"
+	"github.com/diillson/aws-finops-dashboard-go/pkg/version"
 	"github.com/spf13/cobra"
 )
 
@@ -25,20 +24,17 @@ func NewCLIApp(versionStr string) *CLIApp {
 		version: versionStr,
 	}
 
-	// Obtem a versão formatada
 	formattedVersion := version.FormatVersion()
 
 	rootCmd := &cobra.Command{
 		Use:     "aws-finops",
 		Short:   "AWS FinOps Dashboard CLI",
-		Version: formattedVersion, // Use a versão formatada
+		Version: formattedVersion,
 		RunE:    app.runCommand,
 	}
 
-	// Personaliza a template para incluir mais informações de versão
 	rootCmd.SetVersionTemplate(`{{printf "AWS FinOps Dashboard version: %s\n" .Version}}`)
 
-	// Adiciona flags de linha de comando
 	rootCmd.PersistentFlags().StringP("config-file", "C", "", "Path to a TOML, YAML, or JSON configuration file")
 	rootCmd.PersistentFlags().StringSliceP("profiles", "p", nil, "Specific AWS profiles to use (comma-separated)")
 	rootCmd.PersistentFlags().StringSliceP("regions", "r", nil, "AWS regions to check for EC2 instances (comma-separated)")
@@ -49,8 +45,9 @@ func NewCLIApp(versionStr string) *CLIApp {
 	rootCmd.PersistentFlags().StringP("dir", "d", "", "Directory to save the report files (default: current directory)")
 	rootCmd.PersistentFlags().IntP("time-range", "t", 0, "Time range for cost data in days (default: current month)")
 	rootCmd.PersistentFlags().StringSliceP("tag", "g", nil, "Cost allocation tag to filter resources, e.g., --tag Team=DevOps")
-	rootCmd.PersistentFlags().Bool("trend", false, "Display a trend report as bars for the past 6 months time range")
-	rootCmd.PersistentFlags().Bool("audit", false, "Display an audit report with cost anomalies, stopped EC2 instances, unused EBS volumes, budget alerts, and more")
+	rootCmd.PersistentFlags().Bool("trend", false, "Display a trend report for the past 6 months")
+	rootCmd.PersistentFlags().Bool("audit", false, "Display an audit report with potential cost savings")
+	// --- FLAG ADICIONADA ---
 	rootCmd.PersistentFlags().Bool("breakdown-costs", false, "Show a detailed cost breakdown for services like Data Transfer.")
 
 	app.rootCmd = rootCmd
@@ -76,9 +73,9 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 	tag, _ := app.rootCmd.Flags().GetStringSlice("tag")
 	trend, _ := app.rootCmd.Flags().GetBool("trend")
 	audit, _ := app.rootCmd.Flags().GetBool("audit")
+	// --- PARSING ADICIONADO ---
 	breakdownCosts, _ := app.rootCmd.Flags().GetBool("breakdown-costs")
 
-	// Set default directory to current working directory if not specified
 	if dir == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -86,7 +83,6 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 		}
 		dir = cwd
 	} else {
-		// Convert to absolute path
 		absDir, err := filepath.Abs(dir)
 		if err != nil {
 			return nil, err
@@ -94,9 +90,9 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 		dir = absDir
 	}
 
-	timeRangePtr := &timeRange
-	if timeRange == 0 {
-		timeRangePtr = nil
+	var timeRangePtr *int
+	if timeRange > 0 {
+		timeRangePtr = &timeRange
 	}
 
 	args := &types.CLIArgs{
@@ -112,7 +108,7 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 		Tag:            tag,
 		Trend:          trend,
 		Audit:          audit,
-		BreakdownCosts: breakdownCosts,
+		BreakdownCosts: breakdownCosts, // <-- CAMPO ADICIONADO
 	}
 
 	return args, nil
@@ -120,25 +116,14 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 
 // runCommand é o ponto de entrada principal para o comando CLI.
 func (app *CLIApp) runCommand(cmd *cobra.Command, args []string) error {
-	// Exibe o banner de boas-vindas
 	displayWelcomeBanner(app.version)
-
-	// Verifica a versão mais recente disponível
 	go version.CheckLatestVersion(app.version)
 
-	// Analisa os argumentos da linha de comando
 	cliArgs, err := app.parseArgs()
 	if err != nil {
 		return err
 	}
 
-	// Lida com o arquivo de configuração, se especificado
-	if cliArgs.ConfigFile != "" {
-		// Carrega e mescla a configuração
-		// Isso será implementado pelo repositório de configuração
-	}
-
-	// Executa o dashboard
 	ctx := context.Background()
 	return app.dashboardUseCase.RunDashboard(ctx, cliArgs)
 }

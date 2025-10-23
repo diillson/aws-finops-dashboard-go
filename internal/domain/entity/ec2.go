@@ -16,3 +16,5 @@ type UnusedEIPs map[string][]string
 type UntaggedResources map[string]map[string][]string
 
 type IdleLoadBalancers map[string][]string
+
+type UnusedVpcEndpoints map[string][]string

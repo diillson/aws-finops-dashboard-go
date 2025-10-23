@@ -245,7 +245,7 @@ func (r *AWSRepositoryImpl) GetEC2Summary(ctx context.Context, profile string, r
 	return summary, nil
 }
 
-func (r *AWSRepositoryImpl) GetCostData(ctx context.Context, profile string, timeRange *int, tags []string) (entity.CostData, error) {
+func (r *AWSRepositoryImpl) GetCostData(ctx context.Context, profile string, timeRange *int, tags []string, breakdown bool) (entity.CostData, error) {
 	client, err := r.getServiceClient(ctx, profile, "", "costexplorer")
 	if err != nil {
 		return entity.CostData{}, err
@@ -307,7 +307,8 @@ func (r *AWSRepositoryImpl) GetCostData(ctx context.Context, profile string, tim
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		services, err := r.getCostByService(ctx, ceClient, startDate, endDate, filter)
+		// Passa a flag 'breakdown' para a função de busca
+		services, err := r.getCostByService(ctx, ceClient, startDate, endDate, filter, breakdown)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to get cost by service: %w", err)
 			return
@@ -360,7 +361,7 @@ func (r *AWSRepositoryImpl) getCostForPeriod(ctx context.Context, client *costex
 	return totalCost, nil
 }
 
-func (r *AWSRepositoryImpl) getCostByService(ctx context.Context, client *costexplorer.Client, start, end time.Time, filter *ceTypes.Expression) ([]entity.ServiceCost, error) {
+func (r *AWSRepositoryImpl) getCostByService(ctx context.Context, client *costexplorer.Client, start, end time.Time, filter *ceTypes.Expression, breakdown bool) ([]entity.ServiceCost, error) {
 	input := &costexplorer.GetCostAndUsageInput{
 		TimePeriod: &ceTypes.DateInterval{
 			Start: aws.String(start.Format("2006-01-02")),
@@ -384,10 +385,25 @@ func (r *AWSRepositoryImpl) getCostByService(ctx context.Context, client *costex
 		for _, group := range result.ResultsByTime[0].Groups {
 			cost, _ := strconv.ParseFloat(*group.Metrics["UnblendedCost"].Amount, 64)
 			if cost > 0.001 {
-				serviceCosts = append(serviceCosts, entity.ServiceCost{
+				sc := entity.ServiceCost{
 					ServiceName: group.Keys[0],
 					Cost:        cost,
-				})
+				}
+
+				servicesToBreakdown := map[string]bool{
+					"EC2-Other":                    true,
+					"Amazon API Gateway":           true,
+					"Amazon Virtual Private Cloud": true,
+				}
+
+				if breakdown && servicesToBreakdown[sc.ServiceName] {
+					breakdownCosts, err := r.getCostBreakdownForService(ctx, client, start, end, filter, sc.ServiceName)
+					if err == nil {
+						sc.SubCosts = breakdownCosts
+					}
+				}
+
+				serviceCosts = append(serviceCosts, sc)
 			}
 		}
 	}
@@ -397,6 +413,115 @@ func (r *AWSRepositoryImpl) getCostByService(ctx context.Context, client *costex
 	})
 
 	return serviceCosts, nil
+}
+
+func (r *AWSRepositoryImpl) GetUnusedVpcEndpoints(ctx context.Context, profile string, regions []string) (entity.UnusedVpcEndpoints, error) {
+	unusedEndpoints := make(entity.UnusedVpcEndpoints)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, region := range regions {
+		wg.Add(1)
+		go func(rgn string) {
+			defer wg.Done()
+			client, err := r.getServiceClient(ctx, profile, rgn, "ec2")
+			if err != nil {
+				return
+			}
+			ec2Client := client.(*ec2.Client)
+
+			// Filtra por endpoints do tipo "Interface" que estão disponíveis
+			endpoints, err := ec2Client.DescribeVpcEndpoints(ctx, &ec2.DescribeVpcEndpointsInput{
+				Filters: []ec2Types.Filter{
+					{Name: aws.String("vpc-endpoint-type"), Values: []string{"Interface"}},
+					{Name: aws.String("vpc-endpoint-state"), Values: []string{"available"}},
+				},
+			})
+			if err != nil {
+				return
+			}
+
+			var regionUnusedEndpoints []string
+			for _, ep := range endpoints.VpcEndpoints {
+				// Um Interface Endpoint funcional deve ter pelo menos uma Network Interface.
+				// Se a lista de IDs de Network Interface estiver vazia, o endpoint não está servindo tráfego.
+				if len(ep.NetworkInterfaceIds) == 0 {
+					regionUnusedEndpoints = append(regionUnusedEndpoints, *ep.VpcEndpointId)
+				}
+			}
+
+			if len(regionUnusedEndpoints) > 0 {
+				mu.Lock()
+				unusedEndpoints[rgn] = regionUnusedEndpoints
+				mu.Unlock()
+			}
+		}(region)
+	}
+
+	wg.Wait()
+	return unusedEndpoints, nil
+}
+
+func (r *AWSRepositoryImpl) getCostBreakdownForService(ctx context.Context, client *costexplorer.Client, start, end time.Time, filter *ceTypes.Expression, serviceName string) ([]entity.ServiceCost, error) {
+	serviceFilter := &ceTypes.Expression{
+		Dimensions: &ceTypes.DimensionValues{
+			Key:    "SERVICE",
+			Values: []string{serviceName},
+		},
+	}
+
+	finalFilter := serviceFilter
+	if filter != nil {
+		finalFilter = &ceTypes.Expression{
+			And: []ceTypes.Expression{*filter, *serviceFilter},
+		}
+	}
+
+	input := &costexplorer.GetCostAndUsageInput{
+		TimePeriod: &ceTypes.DateInterval{
+			Start: aws.String(start.Format("2006-01-02")),
+			End:   aws.String(end.Format("2006-01-02")),
+		},
+		Granularity: ceTypes.GranularityMonthly,
+		Metrics:     []string{"UnblendedCost"},
+		GroupBy: []ceTypes.GroupDefinition{
+			{Type: ceTypes.GroupDefinitionTypeDimension, Key: aws.String("USAGE_TYPE")},
+		},
+		Filter: finalFilter,
+	}
+
+	result, err := client.GetCostAndUsage(ctx, input)
+	if err != nil {
+		return nil, err
+	}
+
+	var breakdownCosts []entity.ServiceCost
+	if len(result.ResultsByTime) > 0 {
+		for _, group := range result.ResultsByTime[0].Groups {
+			cost, _ := strconv.ParseFloat(*group.Metrics["UnblendedCost"].Amount, 64)
+			if cost > 0.001 {
+				usageType := group.Keys[0]
+				parts := strings.Split(usageType, "-")
+				if len(parts) > 1 {
+					// Remove o prefixo da região (ex: USE2-DataTransfer-Out-Bytes -> DataTransfer-Out-Bytes)
+					if len(parts[0]) == 4 && (strings.HasPrefix(parts[0], "U") || strings.HasPrefix(parts[0], "E") || strings.HasPrefix(parts[0], "AP")) {
+						usageType = strings.Join(parts[1:], "-")
+					}
+				}
+
+				breakdownCosts = append(breakdownCosts, entity.ServiceCost{
+					ServiceName: usageType,
+					Cost:        cost,
+				})
+			}
+		}
+	}
+
+	sort.Slice(breakdownCosts, func(i, j int) bool {
+		return breakdownCosts[i].Cost > breakdownCosts[j].Cost
+	})
+
+	return breakdownCosts, nil
 }
 
 func (r *AWSRepositoryImpl) GetBudgets(ctx context.Context, profile string) ([]entity.BudgetInfo, error) {
@@ -625,20 +750,107 @@ func (r *AWSRepositoryImpl) GetUnusedEIPs(ctx context.Context, profile string, r
 	return eips, nil
 }
 
+// GetNatGatewayCost retorna o custo de processamento de dados para cada NAT Gateway.
+func (r *AWSRepositoryImpl) GetNatGatewayCost(ctx context.Context, profile string, timeRange *int, tags []string) ([]entity.NatGatewayCost, error) {
+	client, err := r.getServiceClient(ctx, profile, "", "costexplorer")
+	if err != nil {
+		return nil, err
+	}
+	ceClient := client.(*costexplorer.Client)
+
+	// Define o período de tempo (usa a mesma lógica do GetCostData)
+	today := time.Now().UTC()
+	var startDate, endDate time.Time
+	if timeRange != nil && *timeRange > 0 {
+		endDate = today
+		startDate = today.AddDate(0, 0, -(*timeRange))
+	} else {
+		startDate = time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, time.UTC)
+		endDate = today
+	}
+
+	// Filtro para pegar apenas custos de processamento de NAT Gateway
+	usageTypeFilter := &ceTypes.Expression{
+		Dimensions: &ceTypes.DimensionValues{
+			Key:          "USAGE_TYPE",
+			Values:       []string{"NatGateway-Bytes"}, // O Usage Type pode variar um pouco, ex: EU-NatGateway-Bytes. Usamos um filtro de string.
+			MatchOptions: []ceTypes.MatchOption{ceTypes.MatchOptionContains},
+		},
+	}
+
+	finalFilter := usageTypeFilter
+	tagFilter, err := parseTagFilter(tags)
+	if err == nil && tagFilter != nil {
+		finalFilter = &ceTypes.Expression{
+			And: []ceTypes.Expression{*tagFilter, *usageTypeFilter},
+		}
+	}
+
+	input := &costexplorer.GetCostAndUsageInput{
+		TimePeriod: &ceTypes.DateInterval{
+			Start: aws.String(startDate.Format("2006-01-02")),
+			End:   aws.String(endDate.Format("2006-01-02")),
+		},
+		Granularity: ceTypes.GranularityMonthly,
+		Metrics:     []string{"UnblendedCost"},
+		Filter:      finalFilter,
+		GroupBy: []ceTypes.GroupDefinition{
+			{Type: ceTypes.GroupDefinitionTypeDimension, Key: aws.String("RESOURCE_ID")},
+			{Type: ceTypes.GroupDefinitionTypeDimension, Key: aws.String("REGION")},
+		},
+	}
+
+	result, err := ceClient.GetCostAndUsage(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get NAT Gateway costs: %w", err)
+	}
+
+	var natCosts []entity.NatGatewayCost
+	if len(result.ResultsByTime) > 0 {
+		for _, group := range result.ResultsByTime[0].Groups {
+			cost, _ := strconv.ParseFloat(*group.Metrics["UnblendedCost"].Amount, 64)
+			// Ignora NAT Gateways sem custo significativo
+			if cost > 0.1 { // Limiar de $0.10 para ser relevante
+				resourceID := group.Keys[0]
+				region := group.Keys[1]
+
+				natCosts = append(natCosts, entity.NatGatewayCost{
+					ResourceID: resourceID,
+					Cost:       cost,
+					Region:     region,
+				})
+			}
+		}
+	}
+
+	// Ordena do mais caro para o mais barato
+	sort.Slice(natCosts, func(i, j int) bool {
+		return natCosts[i].Cost > natCosts[j].Cost
+	})
+
+	return natCosts, nil
+}
+
 func (r *AWSRepositoryImpl) GetUntaggedResources(ctx context.Context, profile string, regions []string) (entity.UntaggedResources, error) {
 	untagged := make(entity.UntaggedResources)
-	untagged["EC2"] = make(map[string][]string)
-	// Adicione outros serviços se necessário
-	// untagged["RDS"] = make(map[string][]string)
-
-	var wg sync.WaitGroup
 	var mu sync.Mutex
 
+	initService := func(service string) {
+		mu.Lock()
+		if _, ok := untagged[service]; !ok {
+			untagged[service] = make(map[string][]string)
+		}
+		mu.Unlock()
+	}
+
+	var wg sync.WaitGroup
 	for _, region := range regions {
 		wg.Add(1)
 		go func(rgn string) {
 			defer wg.Done()
+
 			// EC2
+			initService("EC2")
 			ec2Client, err := r.getServiceClient(ctx, profile, rgn, "ec2")
 			if err == nil {
 				if insts, err := ec2Client.(*ec2.Client).DescribeInstances(ctx, &ec2.DescribeInstancesInput{}); err == nil {
@@ -657,7 +869,44 @@ func (r *AWSRepositoryImpl) GetUntaggedResources(ctx context.Context, profile st
 					}
 				}
 			}
-			// Adicionar busca por outros recursos (RDS, Lambda, etc.) aqui de forma similar.
+
+			// RDS
+			initService("RDS")
+			rdsClient, err := r.getServiceClient(ctx, profile, rgn, "rds")
+			if err == nil {
+				if dbs, err := rdsClient.(*rds.Client).DescribeDBInstances(ctx, &rds.DescribeDBInstancesInput{}); err == nil {
+					var untaggedRDS []string
+					for _, db := range dbs.DBInstances {
+						if len(db.TagList) == 0 {
+							untaggedRDS = append(untaggedRDS, *db.DBInstanceIdentifier)
+						}
+					}
+					if len(untaggedRDS) > 0 {
+						mu.Lock()
+						untagged["RDS"][rgn] = untaggedRDS
+						mu.Unlock()
+					}
+				}
+			}
+
+			// Lambda
+			initService("Lambda")
+			lambdaClient, err := r.getServiceClient(ctx, profile, rgn, "lambda")
+			if err == nil {
+				if funcs, err := lambdaClient.(*lambda.Client).ListFunctions(ctx, &lambda.ListFunctionsInput{}); err == nil {
+					var untaggedLambda []string
+					for _, fn := range funcs.Functions {
+						if tags, err := lambdaClient.(*lambda.Client).ListTags(ctx, &lambda.ListTagsInput{Resource: fn.FunctionArn}); err == nil && len(tags.Tags) == 0 {
+							untaggedLambda = append(untaggedLambda, *fn.FunctionName)
+						}
+					}
+					if len(untaggedLambda) > 0 {
+						mu.Lock()
+						untagged["Lambda"][rgn] = untaggedLambda
+						mu.Unlock()
+					}
+				}
+			}
 		}(region)
 	}
 	wg.Wait()

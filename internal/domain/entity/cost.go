@@ -2,10 +2,11 @@ package entity
 
 import "time"
 
-// ServiceCost represents a cost amount for a specific AWS service.
+// ServiceCost represents a cost amount for a specific AWS service or usage type.
 type ServiceCost struct {
-	ServiceName string  `json:"service_name"`
-	Cost        float64 `json:"cost"`
+	ServiceName string        `json:"service_name"`
+	Cost        float64       `json:"cost"`
+	SubCosts    []ServiceCost `json:"sub_costs,omitempty"` // <-- CAMPO ADICIONADO
 }
 
 // CostData contains all cost-related information for an AWS account.
@@ -27,7 +28,13 @@ type CostData struct {
 
 // MonthlyCost represents the cost for a specific month, used for trend analysis.
 type MonthlyCost struct {
-	Month    string        `json:"month"`
-	Cost     float64       `json:"cost"`
-	SubCosts []ServiceCost `json:"sub_costs,omitempty"`
+	Month string  `json:"month"`
+	Cost  float64 `json:"cost"`
+}
+
+// NatGatewayCost representa o custo de processamento de dados para um NAT Gateway específico.
+type NatGatewayCost struct {
+	ResourceID string  `json:"resource_id"`
+	Cost       float64 `json:"cost"`
+	Region     string  `json:"region"`
 }
