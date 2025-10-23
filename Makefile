@@ -1,84 +1,76 @@
-# Makefile
+# Binário e pacote principal
+BINARY ?= aws-finops
+MAIN_PKG := ./cmd/aws-finops
 
-# Diretórios
-BIN_DIR := ./bin
-DIST_DIR := ./dist
+# Pasta de saída
+BIN_DIR ?= bin
 
-BINARY_NAME := aws-finops
-VERSION     ?= $(shell git describe --tags --abbrev=0 2>/dev/null | sed 's/^v//')
-ifeq ($(VERSION),)
-  VERSION := 0.0.0-dev
-endif
-COMMIT     := $(shell git rev-parse --short HEAD 2>/dev/null || echo development)
-BUILD_TIME       := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-PKG        := github.com/diillson/aws-finops-dashboard-go/pkg/version
-LDFLAGS    := -s -w -X $(PKG).Version=$(VERSION) -X $(PKG).Commit=$(COMMIT) -X $(PKG).BuildTime=$(DATE)
+# Detecta valores do Git (podem ser sobrescritos por env vars)
+VERSION ?= $(shell git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0-dev")
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILDTIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-# Go flags
-GO_FLAGS := -ldflags "$(LDFLAGS)"
+# Marca sufixo -dirty se houver modificações não commitadas
+GIT_DIRTY := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo "-dirty" )
+VERSION := $(VERSION)$(GIT_DIRTY)
 
-.PHONY: all build release clean test lint fmt help install uninstall
+# Flags de linkagem (ldflags)
+LDFLAGS := -s -w \
+	-X github.com/diillson/aws-finops-dashboard-go/pkg/version.Version=$(VERSION) \
+	-X github.com/diillson/aws-finops-dashboard-go/pkg/version.Commit=$(COMMIT) \
+	-X github.com/diillson/aws-finops-dashboard-go/pkg/version.BuildTime=$(BUILDTIME)
 
-all: clean lint test build
+# Go env
+GO ?= go
+GOFLAGS ?=
+CGO_ENABLED ?= 0
 
-# Compila o projeto
+# Lista de plataformas para release (edite conforme necessidade)
+RELEASE_PLATFORMS ?= \
+	linux/amd64 \
+	linux/arm64 \
+	darwin/amd64 \
+	darwin/arm64 \
+	windows/amd64
+
+.PHONY: all build build-dev clean release print-version
+
+all: build
+
+print-version:
+	@echo "Version:    $(VERSION)"
+	@echo "Commit:     $(COMMIT)"
+	@echo "Build Time: $(BUILDTIME)"
+
 build:
-	@echo "Building $(BINARY_NAME) v$(VERSION)..."
 	@mkdir -p $(BIN_DIR)
-	@go build $(GO_FLAGS) -o $(BIN_DIR)/$(BINARY_NAME) cmd/aws-finops/main.go
-	@echo "Build complete: $(BIN_DIR)/$(BINARY_NAME)"
+	@echo "Building $(BINARY) with ldflags (Version=$(VERSION), Commit=$(COMMIT))..."
+	@CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/$(BINARY) $(MAIN_PKG)
+	@echo "Binary: $(BIN_DIR)/$(BINARY)"
+	@$(BIN_DIR)/$(BINARY) --version || true
 
-# Cria o release
+# Build sem ldflags: o pacote version usará o fallback via debug.ReadBuildInfo
+build-dev:
+	@mkdir -p $(BIN_DIR)
+	@echo "Building $(BINARY) (dev) without ldflags..."
+	@CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -o $(BIN_DIR)/$(BINARY) $(MAIN_PKG)
+	@echo "Binary: $(BIN_DIR)/$(BINARY)"
+	@$(BIN_DIR)/$(BINARY) --version || true
+
+# Build de múltiplas plataformas (binários nomeados com OS-ARCH)
 release:
-	@echo "Releasing version $(VERSION)"
-	git tag -a v$(VERSION) -m "Version $(VERSION)"
-	git push origin v$(VERSION)
+	@mkdir -p $(BIN_DIR)
+	@set -e; \
+	for plat in $(RELEASE_PLATFORMS); do \
+			OS=$${plat%/*}; ARCH=$${plat*/}; \
+			OUT="$(BIN_DIR)/$(BINARY)-$${OS}-$${ARCH}"; \
+			if [ "$$OS" = "windows" ]; then OUT="$$OUT.exe"; fi; \
+			echo "Building $$OUT (Version=$(VERSION), Commit=$(COMMIT))"; \
+			GOOS=$$OS GOARCH=$$ARCH CGO_ENABLED=$(CGO_ENABLED) \
+			$(GO) build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o "$$OUT" $(MAIN_PKG); \
+	done
+	@echo "Artifacts in: $(BIN_DIR)"
 
-# Limpa o diretório de build
 clean:
-	@echo "Cleaning..."
-	@rm -rf $(BIN_DIR) $(DIST_DIR)
-	@go clean
-	@echo "Clean complete"
-
-# Roda os testes
-test:
-	@echo "Running tests..."
-	@go test -v ./...
-
-# Roda o linter
-lint:
-	@echo "Running golangci-lint..."
-	@golangci-lint run
-
-# Formata o código
-fmt:
-	@echo "Formatting code..."
-	@gofmt -w -s .
-	@echo "Format complete"
-
-# Instala o binário
-install: build
-	@echo "Installing $(BINARY_NAME)..."
-	@cp $(BIN_DIR)/$(BINARY_NAME) $(GOPATH)/bin/$(BINARY_NAME)
-	@echo "Install complete: $(GOPATH)/bin/$(BINARY_NAME)"
-
-# Desinstala o binário
-uninstall:
-	@echo "Uninstalling $(BINARY_NAME)..."
-	@rm -f $(GOPATH)/bin/$(BINARY_NAME)
-	@echo "Uninstall complete"
-
-# Ajuda
-help:
-	@echo "Available targets:"
-	@echo "  all        : Clean, lint, test and build"
-	@echo "  build      : Build the binary"
-	@echo "  release    : Create a new release"
-	@echo "  clean      : Clean build artifacts"
-	@echo "  test       : Run tests"
-	@echo "  lint       : Run golangci-lint"
-	@echo "  fmt        : Format code"
-	@echo "  install    : Install binary to GOPATH/bin"
-	@echo "  uninstall  : Remove binary from GOPATH/bin"
-	@echo "  help       : Show this help"
+	@rm -rf $(BIN_DIR)
+	@echo "Cleaned $(BIN_DIR)"

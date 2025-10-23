@@ -13,4 +13,9 @@ type ExportRepository interface {
 	ExportAuditReportToPDF(auditData []entity.AuditData, filename string, outputDir string) (string, error)
 	ExportAuditReportToCSV(auditData []entity.AuditData, filename string, outputDir string) (string, error)
 	ExportAuditReportToJSON(auditData []entity.AuditData, filename string, outputDir string) (string, error)
+
+	// Data Transfer Deep Dive
+	ExportTransferReportToCSV(reports []entity.DataTransferReport, filename, outputDir string) (string, error)
+	ExportTransferReportToJSON(reports []entity.DataTransferReport, filename, outputDir string) (string, error)
+	ExportTransferReportToPDF(reports []entity.DataTransferReport, filename, outputDir string) (string, error)
 }

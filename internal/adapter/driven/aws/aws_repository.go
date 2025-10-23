@@ -986,3 +986,166 @@ func (r *AWSRepositoryImpl) GetIdleLoadBalancers(ctx context.Context, profile st
 	wg.Wait()
 	return idleLBs, nil
 }
+
+// GetDataTransferBreakdown retorna um relatório detalhado de custos de Data Transfer.
+// Ele agrega por categorias (Internet, Inter-Region, Cross-AZ/Regional, NAT Gateway, Other)
+// e também retorna as Top Lines por (Service, UsageType).
+func (r *AWSRepositoryImpl) GetDataTransferBreakdown(ctx context.Context, profile string, timeRange *int, tags []string) (entity.DataTransferReport, error) {
+	client, err := r.getServiceClient(ctx, profile, "", "costexplorer")
+	if err != nil {
+		return entity.DataTransferReport{}, err
+	}
+	ceClient := client.(*costexplorer.Client)
+
+	// Define período (mesma lógica de GetCostData)
+	today := time.Now().UTC()
+	var startDate, endDate time.Time
+	periodName := "Current month's data transfer"
+
+	if timeRange != nil && *timeRange > 0 {
+		endDate = today
+		startDate = today.AddDate(0, 0, -(*timeRange))
+		periodName = fmt.Sprintf("Current %d days data transfer", *timeRange)
+	} else {
+		startDate = time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, time.UTC)
+		endDate = today
+		// ajuste para incluir hoje quando estamos no primeiro dia, mesma abordagem do GetCostData
+		if startDate.Day() == endDate.Day() && startDate.Month() == endDate.Month() && startDate.Year() == endDate.Year() {
+			endDate = endDate.AddDate(0, 0, 1)
+		}
+	}
+
+	filter, err := parseTagFilter(tags)
+	if err != nil {
+		return entity.DataTransferReport{}, err
+	}
+
+	input := &costexplorer.GetCostAndUsageInput{
+		TimePeriod: &ceTypes.DateInterval{
+			Start: aws.String(startDate.Format("2006-01-02")),
+			End:   aws.String(endDate.Format("2006-01-02")),
+		},
+		Granularity: ceTypes.GranularityMonthly,
+		Metrics:     []string{"UnblendedCost"},
+		GroupBy: []ceTypes.GroupDefinition{
+			{Type: ceTypes.GroupDefinitionTypeDimension, Key: aws.String("SERVICE")},
+			{Type: ceTypes.GroupDefinitionTypeDimension, Key: aws.String("USAGE_TYPE")},
+		},
+		Filter: filter,
+	}
+
+	result, err := ceClient.GetCostAndUsage(ctx, input)
+	if err != nil {
+		return entity.DataTransferReport{}, fmt.Errorf("failed to get data transfer breakdown: %w", err)
+	}
+
+	categoryTotals := map[string]float64{
+		"Internet":          0,
+		"Inter-Region":      0,
+		"Cross-AZ/Regional": 0,
+		"NAT Gateway":       0,
+		"Other":             0,
+	}
+	var total float64
+	var lines []entity.DataTransferLine
+
+	if len(result.ResultsByTime) > 0 {
+		for _, group := range result.ResultsByTime[0].Groups {
+			if len(group.Keys) < 2 {
+				continue
+			}
+			service := group.Keys[0]
+			usage := group.Keys[1]
+			amountStr := group.Metrics["UnblendedCost"].Amount
+			if amountStr == nil {
+				continue
+			}
+			cost, _ := strconv.ParseFloat(*amountStr, 64)
+			if cost < 0.001 {
+				continue
+			}
+
+			// Classifica a linha
+			category, relevant := classifyUsageType(usage)
+			if !relevant {
+				// Ignora completamente itens irrelevantes ao tema "transfer"
+				continue
+			}
+
+			categoryTotals[category] += cost
+			total += cost
+			lines = append(lines, entity.DataTransferLine{
+				Service:   service,
+				UsageType: usage,
+				Cost:      cost,
+			})
+		}
+	}
+
+	// Ordena top lines por custo desc e limita (ex.: 10)
+	sort.Slice(lines, func(i, j int) bool { return lines[i].Cost > lines[j].Cost })
+	topLimit := 10
+	if len(lines) < topLimit {
+		topLimit = len(lines)
+	}
+	topLines := lines[:topLimit]
+
+	// Monta as categorias ordenadas
+	var categories []entity.DataTransferCategoryCost
+	for k, v := range categoryTotals {
+		if v < 0.001 {
+			continue
+		}
+		categories = append(categories, entity.DataTransferCategoryCost{
+			Category: k,
+			Cost:     v,
+		})
+	}
+	sort.Slice(categories, func(i, j int) bool { return categories[i].Cost > categories[j].Cost })
+
+	accountID, _ := r.GetAccountID(ctx, profile)
+
+	return entity.DataTransferReport{
+		AccountID:   accountID,
+		Total:       total,
+		Categories:  categories,
+		TopLines:    topLines,
+		PeriodStart: startDate,
+		PeriodEnd:   endDate,
+		PeriodName:  periodName,
+	}, nil
+}
+
+// classifyUsageType classifica um USAGE_TYPE em uma das categorias de data transfer.
+// Retorna (categoria, relevante) — relevante = false significa "não é data transfer".
+func classifyUsageType(usage string) (string, bool) {
+	u := strings.ToLower(usage)
+
+	// NAT Gateway
+	if strings.Contains(u, "natgateway-bytes") {
+		return "NAT Gateway", true
+	}
+
+	// Internet egress: DataTransfer-Out-Bytes (com ou sem prefixo regional, ex: USE2-DataTransfer-Out-Bytes)
+	if strings.Contains(u, "datatransfer-out") {
+		return "Internet", true
+	}
+
+	// Inter-Region: InterRegion keywords
+	if strings.Contains(u, "interregion") || strings.Contains(u, "inter-region") {
+		return "Inter-Region", true
+	}
+
+	// Cross-AZ/Regional: Regional-Bytes
+	if strings.Contains(u, "regional-bytes") {
+		return "Cross-AZ/Regional", true
+	}
+
+	// Outros padrões de "transfer" que não se encaixem acima
+	if strings.Contains(u, "datatransfer") || strings.Contains(u, "transfer-bytes") {
+		return "Other", true
+	}
+
+	// Caso contrário, não consideramos relevante para "data transfer"
+	return "Other", false
+}

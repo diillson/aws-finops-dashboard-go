@@ -58,6 +58,9 @@ func (uc *DashboardUseCase) RunDashboard(ctx context.Context, args *types.CLIArg
 	if args.Trend {
 		return uc.runTrendAnalysis(ctx, profileGroups, args)
 	}
+	if args.Transfer {
+		return uc.runDataTransferDeepDive(ctx, profileGroups, args)
+	}
 
 	return uc.runCostDashboard(ctx, profileGroups, args)
 }
@@ -108,6 +111,173 @@ type profileJob struct {
 	Group       entity.ProfileGroup
 	Args        *types.CLIArgs
 	ProgressBar *pterm.ProgressbarPrinter
+}
+
+func (uc *DashboardUseCase) runDataTransferDeepDive(ctx context.Context, profileGroups []entity.ProfileGroup, args *types.CLIArgs) error {
+	uc.console.LogInfo("Analysing data transfer costs...")
+
+	// MultiPrinter para progress bars por perfil
+	livePrinter, _ := uc.console.GetMultiPrinter().Start()
+	defer livePrinter.Stop()
+
+	type row struct {
+		Profile   string
+		AccountID string
+		Report    entity.DataTransferReport
+		Err       error
+	}
+	results := make([]row, 0, len(profileGroups))
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, group := range profileGroups {
+		wg.Add(1)
+		go func(g entity.ProfileGroup) {
+			defer wg.Done()
+
+			bar := uc.console.NewProgressbar(1, fmt.Sprintf("Data Transfer: %s", g.Identifier))
+			bar.Start()
+
+			// Usa o primeiro perfil real do grupo (tal qual trend)
+			profile := g.Profiles[0]
+
+			var timeRange *int
+			if args.TimeRange != nil && *args.TimeRange > 0 {
+				timeRange = args.TimeRange
+			}
+
+			report, err := uc.awsRepo.GetDataTransferBreakdown(ctx, profile, timeRange, args.Tag)
+			if err != nil {
+				mu.Lock()
+				results = append(results, row{Profile: g.Identifier, AccountID: "", Err: err})
+				mu.Unlock()
+				bar.Increment()
+				return
+			}
+
+			accountID := report.AccountID
+			mu.Lock()
+			results = append(results, row{Profile: g.Identifier, AccountID: accountID, Report: report})
+			mu.Unlock()
+			bar.Increment()
+		}(group)
+	}
+	wg.Wait()
+
+	// Ordena por perfil
+	sort.Slice(results, func(i, j int) bool { return results[i].Profile < results[j].Profile })
+
+	// Monta tabela agregada por categoria
+	table := uc.console.CreateTable()
+	table.AddColumn("Profile")
+	table.AddColumn("Account ID")
+	table.AddColumn("Period")
+	table.AddColumn("Total")
+	table.AddColumn("Internet")
+	table.AddColumn("Inter-Region")
+	table.AddColumn("Cross-AZ/Regional")
+	table.AddColumn("NAT Gateway")
+	table.AddColumn("Other")
+
+	getCat := func(cats []entity.DataTransferCategoryCost, name string) float64 {
+		for _, c := range cats {
+			if c.Category == name {
+				return c.Cost
+			}
+		}
+		return 0
+	}
+
+	for _, r := range results {
+		if r.Err != nil {
+			table.AddRow(
+				pterm.FgMagenta.Sprint(r.Profile),
+				"N/A",
+				"N/A",
+				pterm.FgRed.Sprintf("Error: %v", r.Err),
+				"-", "-", "-", "-", "-",
+			)
+			continue
+		}
+
+		rep := r.Report
+		period := fmt.Sprintf("%s to %s", rep.PeriodStart.Format("2006-01-02"), rep.PeriodEnd.Format("2006-01-02"))
+		table.AddRow(
+			pterm.FgMagenta.Sprint(r.Profile),
+			r.AccountID,
+			period,
+			fmt.Sprintf("$%.2f", rep.Total),
+			fmt.Sprintf("$%.2f", getCat(rep.Categories, "Internet")),
+			fmt.Sprintf("$%.2f", getCat(rep.Categories, "Inter-Region")),
+			fmt.Sprintf("$%.2f", getCat(rep.Categories, "Cross-AZ/Regional")),
+			fmt.Sprintf("$%.2f", getCat(rep.Categories, "NAT Gateway")),
+			fmt.Sprintf("$%.2f", getCat(rep.Categories, "Other")),
+		)
+	}
+
+	uc.console.Println("\n" + table.Render())
+
+	// Exibe Top Lines (5) por perfil após a tabela
+	const topShow = 5
+	for _, r := range results {
+		if r.Err != nil {
+			continue
+		}
+		rep := r.Report
+		uc.console.Println(pterm.FgYellow.Sprintf("\nTop data transfer lines for %s (Account: %s)", r.Profile, r.AccountID))
+		lines := rep.TopLines
+		limit := len(lines)
+		if limit > topShow {
+			limit = topShow
+		}
+		for i := 0; i < limit; i++ {
+			l := lines[i]
+			uc.console.Println(fmt.Sprintf("  - %s | %s: $%.2f", l.Service, l.UsageType, l.Cost))
+		}
+		if len(lines) > limit {
+			uc.console.Println(fmt.Sprintf("  ... (+%d more)", len(lines)-limit))
+		}
+	}
+
+	// Export dos relatórios de transferência de dados
+	if args.ReportName != "" {
+		uc.console.LogInfo("Exporting data transfer reports...")
+		// Monta []entity.DataTransferReport
+		reports := make([]entity.DataTransferReport, 0, len(results))
+		for _, r := range results {
+			if r.Err == nil {
+				reports = append(reports, r.Report)
+			}
+		}
+		for _, reportType := range args.ReportType {
+			switch strings.ToLower(reportType) {
+			case "csv":
+				path, err := uc.exportRepo.ExportTransferReportToCSV(reports, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export transfer report to CSV: %v", err)
+				} else {
+					uc.console.LogSuccess("Transfer CSV report saved to: %s", path)
+				}
+			case "json":
+				path, err := uc.exportRepo.ExportTransferReportToJSON(reports, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export transfer report to JSON: %v", err)
+				} else {
+					uc.console.LogSuccess("Transfer JSON report saved to: %s", path)
+				}
+			case "pdf":
+				path, err := uc.exportRepo.ExportTransferReportToPDF(reports, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export transfer report to PDF: %v", err)
+				} else {
+					uc.console.LogSuccess("Transfer PDF report saved to: %s", path)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func (uc *DashboardUseCase) generateDashboardData(ctx context.Context, profileGroups []entity.ProfileGroup, args *types.CLIArgs) []entity.ProfileData {

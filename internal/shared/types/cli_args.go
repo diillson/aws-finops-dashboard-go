@@ -15,4 +15,5 @@ type CLIArgs struct {
 	Trend          bool
 	Audit          bool
 	BreakdownCosts bool
+	Transfer       bool
 }

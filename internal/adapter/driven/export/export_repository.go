@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -413,4 +414,179 @@ func cleanRichTags(text string) string {
 	text = richTagRegex.ReplaceAllString(text, "")
 	text = ansiRegex.ReplaceAllString(text, "")
 	return text
+}
+
+func (r *ExportRepositoryImpl) ExportTransferReportToCSV(reports []entity.DataTransferReport, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "csv")
+	if err != nil {
+		return "", err
+	}
+
+	file, err := os.Create(outputFilename)
+	if err != nil {
+		return "", fmt.Errorf("error creating transfer CSV file: %w", err)
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	headers := []string{
+		"Account ID", "Period", "Total",
+		"Internet", "Inter-Region", "Cross-AZ/Regional", "NAT Gateway", "Other",
+		"Top Lines", // formatado como várias linhas em uma célula
+	}
+	if err := writer.Write(headers); err != nil {
+		return "", fmt.Errorf("error writing CSV header: %w", err)
+	}
+
+	for _, rep := range reports {
+		period := fmt.Sprintf("%s to %s", rep.PeriodStart.Format("2006-01-02"), rep.PeriodEnd.Format("2006-01-02"))
+
+		getCat := func(name string) float64 {
+			for _, c := range rep.Categories {
+				if c.Category == name {
+					return c.Cost
+				}
+			}
+			return 0
+		}
+
+		var topLines []string
+		for _, l := range rep.TopLines {
+			topLines = append(topLines, fmt.Sprintf("%s | %s: $%.2f", l.Service, l.UsageType, l.Cost))
+		}
+
+		record := []string{
+			rep.AccountID,
+			period,
+			fmt.Sprintf("$%.2f", rep.Total),
+			fmt.Sprintf("$%.2f", getCat("Internet")),
+			fmt.Sprintf("$%.2f", getCat("Inter-Region")),
+			fmt.Sprintf("$%.2f", getCat("Cross-AZ/Regional")),
+			fmt.Sprintf("$%.2f", getCat("NAT Gateway")),
+			fmt.Sprintf("$%.2f", getCat("Other")),
+			cleanRichTags(strings.Join(topLines, "\n")),
+		}
+
+		if err := writer.Write(record); err != nil {
+			return "", fmt.Errorf("error writing CSV record: %w", err)
+		}
+	}
+
+	return filepath.Abs(outputFilename)
+}
+
+func (r *ExportRepositoryImpl) ExportTransferReportToJSON(reports []entity.DataTransferReport, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "json")
+	if err != nil {
+		return "", err
+	}
+
+	file, err := os.Create(outputFilename)
+	if err != nil {
+		return "", fmt.Errorf("error creating transfer JSON file: %w", err)
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(reports); err != nil {
+		return "", fmt.Errorf("error encoding transfer JSON data: %w", err)
+	}
+
+	return filepath.Abs(outputFilename)
+}
+
+func (r *ExportRepositoryImpl) ExportTransferReportToPDF(reports []entity.DataTransferReport, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "pdf")
+	if err != nil {
+		return "", err
+	}
+
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	tr := pdf.UnicodeTranslatorFromDescriptor("")
+
+	for i, rep := range reports {
+		pdf.AddPage()
+		headerColor := [3]int{0, 102, 204}
+		headerTextColor := [3]int{255, 255, 255}
+		sectionTitleColor := [3]int{0, 0, 0}
+		bodyTextColor := [3]int{50, 50, 50}
+		lineColor := [3]int{200, 200, 200}
+
+		drawSection := func(title string, content string) {
+			content = cleanRichTags(content)
+			if strings.TrimSpace(content) == "" {
+				return
+			}
+			pdf.SetFont("Arial", "B", 12)
+			pdf.SetTextColor(sectionTitleColor[0], sectionTitleColor[1], sectionTitleColor[2])
+			pdf.Cell(0, 8, tr(title))
+			pdf.Ln(7)
+
+			pdf.SetDrawColor(lineColor[0], lineColor[1], lineColor[2])
+			pdf.Line(pdf.GetX(), pdf.GetY(), pdf.GetX()+190, pdf.GetY())
+			pdf.Ln(4)
+
+			pdf.SetFont("Arial", "", 10)
+			pdf.SetTextColor(bodyTextColor[0], bodyTextColor[1], bodyTextColor[2])
+			pdf.MultiCell(190, 5, tr(content), "", "L", false)
+			pdf.Ln(8)
+		}
+
+		// Cabeçalho
+		pdf.SetFillColor(headerColor[0], headerColor[1], headerColor[2])
+		pdf.SetTextColor(headerTextColor[0], headerTextColor[1], headerTextColor[2])
+		pdf.SetFont("Arial", "B", 14)
+		pdf.CellFormat(0, 12, tr("  Data Transfer Deep Dive"), "", 1, "L", true, 0, "")
+		pdf.SetFont("Arial", "", 10)
+		pdf.SetFillColor(240, 240, 240)
+		pdf.SetTextColor(bodyTextColor[0], bodyTextColor[1], bodyTextColor[2])
+		pdf.CellFormat(0, 8, tr(fmt.Sprintf("  Account ID: %s", rep.AccountID)), "", 1, "L", true, 0, "")
+		pdf.CellFormat(0, 8, tr(fmt.Sprintf("  Period: %s to %s", rep.PeriodStart.Format("2006-01-02"), rep.PeriodEnd.Format("2006-01-02"))), "", 1, "L", true, 0, "")
+		pdf.Ln(8)
+
+		// Resumo por categoria
+		var b strings.Builder
+		b.WriteString(fmt.Sprintf("Total: $%.2f\n\n", rep.Total))
+		// Ordena categorias por custo desc já vem ordenado do repo, mas garantimos:
+		cats := make([]entity.DataTransferCategoryCost, len(rep.Categories))
+		copy(cats, rep.Categories)
+		sort.Slice(cats, func(i, j int) bool { return cats[i].Cost > cats[j].Cost })
+		for _, c := range cats {
+			b.WriteString(fmt.Sprintf("%s: $%.2f\n", c.Category, c.Cost))
+		}
+		drawSection("Category Summary", b.String())
+
+		// Top Lines
+		if len(rep.TopLines) > 0 {
+			var tl strings.Builder
+			limit := len(rep.TopLines)
+			if limit > 15 {
+				limit = 15
+			}
+			for i := 0; i < limit; i++ {
+				l := rep.TopLines[i]
+				tl.WriteString(fmt.Sprintf("%s | %s: $%.2f\n", l.Service, l.UsageType, l.Cost))
+			}
+			if len(rep.TopLines) > limit {
+				tl.WriteString(fmt.Sprintf("... (+%d more)\n", len(rep.TopLines)-limit))
+			}
+			drawSection("Top Lines", tl.String())
+		}
+
+		// Rodapé
+		pdf.SetY(-15)
+		pdf.SetFont("Arial", "I", 8)
+		pdf.SetTextColor(128, 128, 128)
+		footerText := fmt.Sprintf("Data Transfer | %s", time.Now().Format("2006-01-02"))
+		pdf.CellFormat(0, 10, tr(footerText), "", 0, "L", false, 0, "")
+		pdf.CellFormat(0, 10, tr(fmt.Sprintf("Page %d", i+1)), "", 0, "R", false, 0, "")
+	}
+
+	if err := pdf.OutputFileAndClose(outputFilename); err != nil {
+		return "", fmt.Errorf("error writing transfer PDF file: %w", err)
+	}
+	return filepath.Abs(outputFilename)
 }

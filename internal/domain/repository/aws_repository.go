@@ -18,7 +18,6 @@ type AWSRepository interface {
 	GetAccessibleRegions(ctx context.Context, profile string) ([]string, error)
 
 	// Cost Operations
-	// --- ASSINATURA ALTERADA ---
 	GetCostData(ctx context.Context, profile string, timeRange *int, tags []string, breakdown bool) (entity.CostData, error)
 	GetTrendData(ctx context.Context, profile string, tags []string) (map[string]interface{}, error)
 
@@ -34,4 +33,7 @@ type AWSRepository interface {
 	GetIdleLoadBalancers(ctx context.Context, profile string, regions []string) (entity.IdleLoadBalancers, error)
 	GetNatGatewayCost(ctx context.Context, profile string, timeRange *int, tags []string) ([]entity.NatGatewayCost, error)
 	GetUnusedVpcEndpoints(ctx context.Context, profile string, regions []string) (entity.UnusedVpcEndpoints, error)
+
+	// Data Transfer Deep Dive
+	GetDataTransferBreakdown(ctx context.Context, profile string, timeRange *int, tags []string) (entity.DataTransferReport, error)
 }

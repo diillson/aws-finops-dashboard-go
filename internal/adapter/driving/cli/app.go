@@ -47,8 +47,8 @@ func NewCLIApp(versionStr string) *CLIApp {
 	rootCmd.PersistentFlags().StringSliceP("tag", "g", nil, "Cost allocation tag to filter resources, e.g., --tag Team=DevOps")
 	rootCmd.PersistentFlags().Bool("trend", false, "Display a trend report for the past 6 months")
 	rootCmd.PersistentFlags().Bool("audit", false, "Display an audit report with potential cost savings")
-	// --- FLAG ADICIONADA ---
 	rootCmd.PersistentFlags().Bool("breakdown-costs", false, "Show a detailed cost breakdown for services like Data Transfer.")
+	rootCmd.PersistentFlags().Bool("transfer", false, "Display a Data Transfer Deep Dive report")
 
 	app.rootCmd = rootCmd
 	return app
@@ -73,8 +73,8 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 	tag, _ := app.rootCmd.Flags().GetStringSlice("tag")
 	trend, _ := app.rootCmd.Flags().GetBool("trend")
 	audit, _ := app.rootCmd.Flags().GetBool("audit")
-	// --- PARSING ADICIONADO ---
 	breakdownCosts, _ := app.rootCmd.Flags().GetBool("breakdown-costs")
+	transfer, _ := app.rootCmd.Flags().GetBool("transfer") // <-- NOVO
 
 	if dir == "" {
 		cwd, err := os.Getwd()
@@ -108,7 +108,8 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 		Tag:            tag,
 		Trend:          trend,
 		Audit:          audit,
-		BreakdownCosts: breakdownCosts, // <-- CAMPO ADICIONADO
+		BreakdownCosts: breakdownCosts,
+		Transfer:       transfer,
 	}
 
 	return args, nil
