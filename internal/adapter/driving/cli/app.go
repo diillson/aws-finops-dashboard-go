@@ -2,9 +2,10 @@ package cli
 
 import (
 	"context"
-	"github.com/diillson/aws-finops-dashboard-go/pkg/version"
 	"os"
 	"path/filepath"
+
+	"github.com/diillson/aws-finops-dashboard-go/pkg/version"
 
 	"github.com/diillson/aws-finops-dashboard-go/internal/application/usecase"
 	"github.com/diillson/aws-finops-dashboard-go/internal/shared/types"
@@ -50,6 +51,7 @@ func NewCLIApp(versionStr string) *CLIApp {
 	rootCmd.PersistentFlags().StringSliceP("tag", "g", nil, "Cost allocation tag to filter resources, e.g., --tag Team=DevOps")
 	rootCmd.PersistentFlags().Bool("trend", false, "Display a trend report as bars for the past 6 months time range")
 	rootCmd.PersistentFlags().Bool("audit", false, "Display an audit report with cost anomalies, stopped EC2 instances, unused EBS volumes, budget alerts, and more")
+	rootCmd.PersistentFlags().Bool("breakdown-costs", false, "Show a detailed cost breakdown for services like Data Transfer.")
 
 	app.rootCmd = rootCmd
 	return app
@@ -74,6 +76,7 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 	tag, _ := app.rootCmd.Flags().GetStringSlice("tag")
 	trend, _ := app.rootCmd.Flags().GetBool("trend")
 	audit, _ := app.rootCmd.Flags().GetBool("audit")
+	breakdownCosts, _ := app.rootCmd.Flags().GetBool("breakdown-costs")
 
 	// Set default directory to current working directory if not specified
 	if dir == "" {
@@ -97,18 +100,19 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 	}
 
 	args := &types.CLIArgs{
-		ConfigFile: configFile,
-		Profiles:   profiles,
-		Regions:    regions,
-		All:        all,
-		Combine:    combine,
-		ReportName: reportName,
-		ReportType: reportType,
-		Dir:        dir,
-		TimeRange:  timeRangePtr,
-		Tag:        tag,
-		Trend:      trend,
-		Audit:      audit,
+		ConfigFile:     configFile,
+		Profiles:       profiles,
+		Regions:        regions,
+		All:            all,
+		Combine:        combine,
+		ReportName:     reportName,
+		ReportType:     reportType,
+		Dir:            dir,
+		TimeRange:      timeRangePtr,
+		Tag:            tag,
+		Trend:          trend,
+		Audit:          audit,
+		BreakdownCosts: breakdownCosts,
 	}
 
 	return args, nil

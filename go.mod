@@ -11,14 +11,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2 v1.45.2
 	github.com/aws/aws-sdk-go-v2/service/lambda v1.71.2
 	github.com/aws/aws-sdk-go-v2/service/rds v1.95.0
-	github.com/aws/aws-sdk-go-v2/service/resourcegroupstaggingapi v1.26.3
 	github.com/aws/aws-sdk-go-v2/service/sts v1.33.19
 	github.com/fatih/color v1.18.0
 	github.com/jung-kurt/gofpdf v1.16.2
 	github.com/pelletier/go-toml v1.9.5
 	github.com/pterm/pterm v0.12.80
 	github.com/spf13/cobra v1.9.1
-	golang.org/x/exp v0.0.0-20220909182711-5c715a9e8561
 	gopkg.in/yaml.v3 v3.0.1
 )
 

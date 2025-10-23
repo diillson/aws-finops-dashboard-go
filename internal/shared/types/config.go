@@ -12,4 +12,5 @@ type Config struct {
 	Tag        []string `json:"tag" yaml:"tag" toml:"tag"`
 	Audit      bool     `json:"audit" yaml:"audit" toml:"audit"`
 	Trend      bool     `json:"trend" yaml:"trend" toml:"trend"`
+	All        bool
 }

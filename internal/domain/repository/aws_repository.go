@@ -32,4 +32,5 @@ type AWSRepository interface {
 
 	// Resource Operations
 	GetUntaggedResources(ctx context.Context, profile string, regions []string) (entity.UntaggedResources, error)
+	GetIdleLoadBalancers(ctx context.Context, profile string, regions []string) (entity.IdleLoadBalancers, error)
 }

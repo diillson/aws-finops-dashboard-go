@@ -1,5 +1,7 @@
 package types
 
+import "github.com/pterm/pterm"
+
 // ConsoleInterface define a interface para saída no console.
 type ConsoleInterface interface {
 	Print(a ...interface{})
@@ -11,24 +13,25 @@ type ConsoleInterface interface {
 	LogError(format string, a ...interface{})
 	LogSuccess(format string, a ...interface{})
 
+	// Status retorna um manipulador para um spinner.
 	Status(message string) StatusHandle
-	Progress(items []string) ProgressHandle
 
+	// GetMultiPrinter retorna a instância padrão do MultiPrinter da pterm.
+	GetMultiPrinter() *pterm.MultiPrinter
+
+	// NewProgressbar cria e retorna uma nova barra de progresso da pterm.
+	NewProgressbar(total int, title string) *pterm.ProgressbarPrinter
+
+	// CreateTable cria uma interface para uma tabela.
 	CreateTable() TableInterface
-	DisplayTrendBars(monthlyCosts []MonthlyCost)
 
-	ProgressWithTotal(total int) ProgressHandle
+	// DisplayTrendBars exibe os gráficos de barras de tendência.
+	DisplayTrendBars(monthlyCosts []MonthlyCost)
 }
 
-// StatusHandle é uma interface para atualizar uma mensagem de status.
+// StatusHandle é uma interface para atualizar uma mensagem de status (spinner).
 type StatusHandle interface {
 	Update(message string)
-	Stop()
-}
-
-// ProgressHandle é uma interface para atualizar uma barra de progresso.
-type ProgressHandle interface {
-	Increment()
 	Stop()
 }
 

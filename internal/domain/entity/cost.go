@@ -27,6 +27,7 @@ type CostData struct {
 
 // MonthlyCost represents the cost for a specific month, used for trend analysis.
 type MonthlyCost struct {
-	Month string  `json:"month"`
-	Cost  float64 `json:"cost"`
+	Month    string        `json:"month"`
+	Cost     float64       `json:"cost"`
+	SubCosts []ServiceCost `json:"sub_costs,omitempty"`
 }

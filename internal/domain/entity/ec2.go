@@ -14,3 +14,5 @@ type UnusedEIPs map[string][]string
 
 // UntaggedResources represents untagged resources grouped by service and region.
 type UntaggedResources map[string]map[string][]string
+
+type IdleLoadBalancers map[string][]string
