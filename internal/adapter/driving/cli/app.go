@@ -45,7 +45,8 @@ func NewCLIApp(versionStr string) *CLIApp {
 	rootCmd.PersistentFlags().Bool("audit", false, "Display an audit report with potential cost savings")
 	rootCmd.PersistentFlags().Bool("breakdown-costs", false, "Show a detailed cost breakdown for services like Data Transfer.")
 	rootCmd.PersistentFlags().Bool("transfer", false, "Display a Data Transfer Deep Dive report")
-	rootCmd.PersistentFlags().Bool("logs-audit", false, "Display a CloudWatch Logs Retention Audit report") // <-- NOVO
+	rootCmd.PersistentFlags().Bool("logs-audit", false, "Display a CloudWatch Logs Retention Audit report")
+	rootCmd.PersistentFlags().Bool("s3-audit", false, "Display an S3 Lifecycle Audit report") // <-- NOVO
 
 	app.rootCmd = rootCmd
 	return app
@@ -72,7 +73,8 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 	audit, _ := app.rootCmd.Flags().GetBool("audit")
 	breakdownCosts, _ := app.rootCmd.Flags().GetBool("breakdown-costs")
 	transfer, _ := app.rootCmd.Flags().GetBool("transfer")
-	logsAudit, _ := app.rootCmd.Flags().GetBool("logs-audit") // <-- NOVO
+	logsAudit, _ := app.rootCmd.Flags().GetBool("logs-audit")
+	s3Audit, _ := app.rootCmd.Flags().GetBool("s3-audit") // <-- NOVO
 
 	if dir == "" {
 		cwd, err := os.Getwd()
@@ -109,6 +111,7 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 		BreakdownCosts: breakdownCosts,
 		Transfer:       transfer,
 		LogsAudit:      logsAudit,
+		S3Audit:        s3Audit,
 	}
 	return args, nil
 }

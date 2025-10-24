@@ -735,3 +735,203 @@ func (r *ExportRepositoryImpl) ExportLogsAuditToPDF(audits []entity.CloudWatchLo
 	}
 	return filepath.Abs(outputFilename)
 }
+
+func (r *ExportRepositoryImpl) ExportS3LifecycleAuditToCSV(audits []entity.S3LifecycleAudit, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "csv")
+	if err != nil {
+		return "", err
+	}
+
+	f, err := os.Create(outputFilename)
+	if err != nil {
+		return "", fmt.Errorf("error creating S3 lifecycle audit CSV file: %w", err)
+	}
+	defer f.Close()
+
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	headers := []string{
+		"Profile", "Account ID",
+		"Total Buckets", "No Lifecycle", "Versioned w/o Noncurrent Rule",
+		"No Intelligent-Tiering", "No Default Encryption", "Public Risk",
+		"Samples",
+	}
+	if err := w.Write(headers); err != nil {
+		return "", fmt.Errorf("error writing CSV header: %w", err)
+	}
+
+	for _, a := range audits {
+		var samples []string
+		limit := func(list []entity.S3BucketLifecycleStatus, n int, label string) {
+			m := len(list)
+			if m > n {
+				m = n
+			}
+			for i := 0; i < m; i++ {
+				s := list[i]
+				samples = append(samples, fmt.Sprintf("[%s] %s (%s)", label, s.Bucket, s.Region))
+			}
+			if len(list) > m {
+				samples = append(samples, fmt.Sprintf("... (+%d more)", len(list)-m))
+			}
+		}
+		limit(a.SampleNoLifecycle, 5, "NoLifecycle")
+		limit(a.SampleVersionedWithoutNoncurrentRule, 5, "Versioned-NoNoncurrent")
+		limit(a.SampleNoIntelligentTiering, 5, "No-IT")
+		limit(a.SampleNoDefaultEncryption, 5, "No-Enc")
+		limit(a.SamplePublicRisk, 5, "Public")
+
+		record := []string{
+			a.Profile,
+			a.AccountID,
+			fmt.Sprintf("%d", a.TotalBuckets),
+			fmt.Sprintf("%d", a.NoLifecycleCount),
+			fmt.Sprintf("%d", a.VersionedWithoutNoncurrentLifecycle),
+			fmt.Sprintf("%d", a.NoIntelligentTieringCount),
+			fmt.Sprintf("%d", a.NoDefaultEncryptionCount),
+			fmt.Sprintf("%d", a.PublicRiskCount),
+			cleanRichTags(strings.Join(samples, "\n")),
+		}
+		if err := w.Write(record); err != nil {
+			return "", fmt.Errorf("error writing CSV record: %w", err)
+		}
+	}
+	return filepath.Abs(outputFilename)
+}
+
+func (r *ExportRepositoryImpl) ExportS3LifecycleAuditToJSON(audits []entity.S3LifecycleAudit, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "json")
+	if err != nil {
+		return "", err
+	}
+
+	f, err := os.Create(outputFilename)
+	if err != nil {
+		return "", fmt.Errorf("error creating S3 lifecycle audit JSON file: %w", err)
+	}
+	defer f.Close()
+
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(audits); err != nil {
+		return "", fmt.Errorf("error encoding S3 lifecycle audit JSON: %w", err)
+	}
+	return filepath.Abs(outputFilename)
+}
+
+func (r *ExportRepositoryImpl) ExportS3LifecycleAuditToPDF(audits []entity.S3LifecycleAudit, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "pdf")
+	if err != nil {
+		return "", err
+	}
+
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	tr := pdf.UnicodeTranslatorFromDescriptor("")
+
+	for i, a := range audits {
+		pdf.AddPage()
+		headerColor := [3]int{0, 128, 128}
+		headerTextColor := [3]int{255, 255, 255}
+		sectionTitleColor := [3]int{0, 0, 0}
+		bodyTextColor := [3]int{50, 50, 50}
+		lineColor := [3]int{200, 200, 200}
+
+		drawSection := func(title string, content string) {
+			content = cleanRichTags(content)
+			if strings.TrimSpace(content) == "" {
+				return
+			}
+			pdf.SetFont("Arial", "B", 12)
+			pdf.SetTextColor(sectionTitleColor[0], sectionTitleColor[1], sectionTitleColor[2])
+			pdf.Cell(0, 8, tr(title))
+			pdf.Ln(7)
+			pdf.SetDrawColor(lineColor[0], lineColor[1], lineColor[2])
+			pdf.Line(pdf.GetX(), pdf.GetY(), pdf.GetX()+190, pdf.GetY())
+			pdf.Ln(4)
+			pdf.SetFont("Arial", "", 10)
+			pdf.SetTextColor(bodyTextColor[0], bodyTextColor[1], bodyTextColor[2])
+			pdf.MultiCell(190, 5, tr(content), "", "L", false)
+			pdf.Ln(8)
+		}
+
+		// Header
+		pdf.SetFillColor(headerColor[0], headerColor[1], headerColor[2])
+		pdf.SetTextColor(headerTextColor[0], headerTextColor[1], headerTextColor[2])
+		pdf.SetFont("Arial", "B", 14)
+		pdf.CellFormat(0, 12, tr("  S3 Lifecycle Audit"), "", 1, "L", true, 0, "")
+		pdf.SetFont("Arial", "", 10)
+		pdf.SetFillColor(240, 240, 240)
+		pdf.SetTextColor(bodyTextColor[0], bodyTextColor[1], bodyTextColor[2])
+		pdf.CellFormat(0, 8, tr(fmt.Sprintf("  Profile: %s", a.Profile)), "", 1, "L", true, 0, "")
+		pdf.CellFormat(0, 8, tr(fmt.Sprintf("  Account ID: %s", a.AccountID)), "", 1, "L", true, 0, "")
+		pdf.Ln(6)
+
+		// Summary
+		summary := fmt.Sprintf(
+			"Total Buckets: %d\nNo Lifecycle: %d\nVersioned w/o Noncurrent Rule: %d\nNo Intelligent-Tiering: %d\nNo Default Encryption: %d\nPublic Risk: %d\n\nRecommendation: %s",
+			a.TotalBuckets, a.NoLifecycleCount, a.VersionedWithoutNoncurrentLifecycle, a.NoIntelligentTieringCount, a.NoDefaultEncryptionCount, a.PublicRiskCount, a.RecommendedMessage,
+		)
+		drawSection("Summary", summary)
+
+		// Regions breakdown (No Lifecycle)
+		if len(a.RegionsNoLifecycle) > 0 {
+			var b strings.Builder
+			// ordenar regiões
+			type kv struct {
+				k string
+				v int
+			}
+			var pairs []kv
+			for k, v := range a.RegionsNoLifecycle {
+				pairs = append(pairs, kv{k, v})
+			}
+			sort.Slice(pairs, func(i, j int) bool { return pairs[i].k < pairs[j].k })
+			for _, p := range pairs {
+				b.WriteString(fmt.Sprintf("%s: %d\n", p.k, p.v))
+			}
+			drawSection("No Lifecycle by Region", b.String())
+		}
+
+		// Samples
+		if len(a.SampleNoLifecycle)+len(a.SampleVersionedWithoutNoncurrentRule)+len(a.SampleNoIntelligentTiering)+len(a.SampleNoDefaultEncryption)+len(a.SamplePublicRisk) > 0 {
+			var s strings.Builder
+			writeList := func(title string, list []entity.S3BucketLifecycleStatus, max int) {
+				if len(list) == 0 {
+					return
+				}
+				s.WriteString(title + ":\n")
+				limit := len(list)
+				if limit > max {
+					limit = max
+				}
+				for i := 0; i < limit; i++ {
+					b := list[i]
+					s.WriteString(fmt.Sprintf("  - %s (%s)\n", b.Bucket, b.Region))
+				}
+				if len(list) > limit {
+					s.WriteString(fmt.Sprintf("  ... (+%d more)\n", len(list)-limit))
+				}
+				s.WriteString("\n")
+			}
+			writeList("No Lifecycle", a.SampleNoLifecycle, 15)
+			writeList("Versioned without Noncurrent Rule", a.SampleVersionedWithoutNoncurrentRule, 15)
+			writeList("No Intelligent-Tiering", a.SampleNoIntelligentTiering, 15)
+			writeList("No Default Encryption", a.SampleNoDefaultEncryption, 15)
+			writeList("Public Risk", a.SamplePublicRisk, 15)
+			drawSection("Samples", s.String())
+		}
+
+		// Footer
+		pdf.SetY(-15)
+		pdf.SetFont("Arial", "I", 8)
+		pdf.SetTextColor(128, 128, 128)
+		pdf.CellFormat(0, 10, tr(fmt.Sprintf("S3 Lifecycle Audit | %s", time.Now().Format("2006-01-02"))), "", 0, "L", false, 0, "")
+		pdf.CellFormat(0, 10, tr(fmt.Sprintf("Page %d", i+1)), "", 0, "R", false, 0, "")
+	}
+
+	if err := pdf.OutputFileAndClose(outputFilename); err != nil {
+		return "", fmt.Errorf("error writing S3 lifecycle audit PDF: %w", err)
+	}
+	return filepath.Abs(outputFilename)
+}

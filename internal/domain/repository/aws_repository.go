@@ -39,4 +39,7 @@ type AWSRepository interface {
 
 	// CloudWatch Logs Retention Audit
 	GetCloudWatchLogGroups(ctx context.Context, profile string, regions []string) ([]entity.CloudWatchLogGroupInfo, error)
+
+	// S3 Lifecycle Audit
+	GetS3LifecycleStatus(ctx context.Context, profile string) ([]entity.S3BucketLifecycleStatus, error)
 }

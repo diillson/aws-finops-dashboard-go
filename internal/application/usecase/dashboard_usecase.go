@@ -52,7 +52,10 @@ func (uc *DashboardUseCase) RunDashboard(ctx context.Context, args *types.CLIArg
 		return nil
 	}
 
-	// Ordem dos relatórios
+	// Ordem de prioridade dos relatórios específicos
+	if args.S3Audit {
+		return uc.runS3LifecycleAudit(ctx, profileGroups, args)
+	}
 	if args.LogsAudit {
 		return uc.runCloudWatchLogsAudit(ctx, profileGroups, args)
 	}
@@ -1253,5 +1256,239 @@ func (uc *DashboardUseCase) calculatePercentageChange(current, previous float64)
 		zero := 0.0
 		return &zero
 	}
+	return nil
+}
+
+func (uc *DashboardUseCase) runS3LifecycleAudit(ctx context.Context, profileGroups []entity.ProfileGroup, args *types.CLIArgs) error {
+	uc.console.LogInfo("Auditing S3 lifecycle, encryption and public access...")
+
+	livePrinter, _ := uc.console.GetMultiPrinter().Start()
+	defer livePrinter.Stop()
+
+	type row struct {
+		Profile   string
+		AccountID string
+		Audit     entity.S3LifecycleAudit
+		Err       error
+	}
+
+	results := make([]row, 0, len(profileGroups))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, group := range profileGroups {
+		wg.Add(1)
+		go func(g entity.ProfileGroup) {
+			defer wg.Done()
+			bar := uc.console.NewProgressbar(2, fmt.Sprintf("S3 Audit: %s", g.Identifier))
+			bar.Start()
+
+			profile := g.Profiles[0]
+			accountID, _ := uc.awsRepo.GetAccountID(ctx, profile)
+			bar.Increment()
+
+			statuses, err := uc.awsRepo.GetS3LifecycleStatus(ctx, profile)
+			if err != nil {
+				mu.Lock()
+				results = append(results, row{Profile: g.Identifier, Err: err})
+				mu.Unlock()
+				bar.Increment()
+				return
+			}
+			bar.Increment()
+
+			// Agrega
+			total := len(statuses)
+			noLifecycle := 0
+			versionedMissingNoncurrent := 0
+			noIT := 0
+			noDefaultEnc := 0
+			publicRisk := 0
+
+			regionMap := make(map[string]int)
+
+			sampleNoLifecycle := make([]entity.S3BucketLifecycleStatus, 0, 10)
+			sampleVersionedNoNoncurrent := make([]entity.S3BucketLifecycleStatus, 0, 10)
+			sampleNoIT := make([]entity.S3BucketLifecycleStatus, 0, 10)
+			sampleNoEnc := make([]entity.S3BucketLifecycleStatus, 0, 10)
+			samplePublic := make([]entity.S3BucketLifecycleStatus, 0, 10)
+
+			// Ordena por nome para amostras determinísticas
+			sort.Slice(statuses, func(i, j int) bool { return statuses[i].Bucket < statuses[j].Bucket })
+
+			for _, s := range statuses {
+				// Lifecycle faltando
+				if !s.HasLifecycle {
+					noLifecycle++
+					regionMap[s.Region]++
+					if len(sampleNoLifecycle) < 10 {
+						sampleNoLifecycle = append(sampleNoLifecycle, s)
+					}
+				}
+				// Versioning sem Noncurrent
+				if s.VersioningEnabled && !s.HasNoncurrentLifecycle {
+					versionedMissingNoncurrent++
+					if len(sampleVersionedNoNoncurrent) < 10 {
+						sampleVersionedNoNoncurrent = append(sampleVersionedNoNoncurrent, s)
+					}
+				}
+				// Intelligent-Tiering ausente (nem via Lifecycle, nem config explícita)
+				if !s.HasIntelligentTieringCfg && !s.HasIntelligentTieringViaLifecycle {
+					noIT++
+					if len(sampleNoIT) < 10 {
+						sampleNoIT = append(sampleNoIT, s)
+					}
+				}
+				// Criptografia padrão ausente
+				if !s.DefaultEncryptionEnabled {
+					noDefaultEnc++
+					if len(sampleNoEnc) < 10 {
+						sampleNoEnc = append(sampleNoEnc, s)
+					}
+				}
+				// Risco de público
+				if s.IsPublic || !s.BlockPublicAcls || !s.BlockPublicPolicy || !s.IgnorePublicAcls || !s.RestrictPublicBuckets {
+					publicRisk++
+					if len(samplePublic) < 10 {
+						samplePublic = append(samplePublic, s)
+					}
+				}
+			}
+
+			audit := entity.S3LifecycleAudit{
+				Profile:                              g.Identifier,
+				AccountID:                            accountID,
+				TotalBuckets:                         total,
+				NoLifecycleCount:                     noLifecycle,
+				VersionedWithoutNoncurrentLifecycle:  versionedMissingNoncurrent,
+				NoIntelligentTieringCount:            noIT,
+				NoDefaultEncryptionCount:             noDefaultEnc,
+				PublicRiskCount:                      publicRisk,
+				SampleNoLifecycle:                    sampleNoLifecycle,
+				SampleVersionedWithoutNoncurrentRule: sampleVersionedNoNoncurrent,
+				SampleNoIntelligentTiering:           sampleNoIT,
+				SampleNoDefaultEncryption:            sampleNoEnc,
+				SamplePublicRisk:                     samplePublic,
+				RegionsNoLifecycle:                   regionMap,
+				RecommendedMessage:                   "Set lifecycle (incl. noncurrent rules), enable default encryption (SSE-S3/KMS), enforce Public Access Block and avoid public ACL/policies; consider Intelligent-Tiering for unpredictable access.",
+			}
+
+			mu.Lock()
+			results = append(results, row{
+				Profile:   g.Identifier,
+				AccountID: accountID,
+				Audit:     audit,
+			})
+			mu.Unlock()
+		}(group)
+	}
+	wg.Wait()
+
+	// Ordena por perfil
+	sort.Slice(results, func(i, j int) bool { return results[i].Profile < results[j].Profile })
+
+	// Monta tabela
+	table := uc.console.CreateTable()
+	table.AddColumn("Profile")
+	table.AddColumn("Account ID")
+	table.AddColumn("Buckets")
+	table.AddColumn("No Lifecycle")
+	table.AddColumn("Versioned w/o Noncurrent")
+	table.AddColumn("No Intelligent-Tiering")
+	table.AddColumn("No Default Encryption")
+	table.AddColumn("Public Risk")
+	table.AddColumn("Samples")
+
+	for _, r := range results {
+		if r.Err != nil {
+			table.AddRow(
+				pterm.FgMagenta.Sprint(r.Profile),
+				"N/A",
+				"N/A",
+				pterm.FgRed.Sprintf("Error: %v", r.Err),
+				"-",
+				"-",
+				"-",
+				"-",
+				"-",
+			)
+			continue
+		}
+
+		// Amostras curtas
+		var lines []string
+		add := func(prefix string, list []entity.S3BucketLifecycleStatus, max int) {
+			limit := len(list)
+			if limit > max {
+				limit = max
+			}
+			for i := 0; i < limit; i++ {
+				s := list[i]
+				lines = append(lines, fmt.Sprintf("[%s] %s (%s)", prefix, s.Bucket, s.Region))
+			}
+			if len(list) > limit {
+				lines = append(lines, fmt.Sprintf("... (+%d more)", len(list)-limit))
+			}
+		}
+
+		add("NoLifecycle", r.Audit.SampleNoLifecycle, 2)
+		add("Versioned-NoNoncurrent", r.Audit.SampleVersionedWithoutNoncurrentRule, 2)
+		add("No-IT", r.Audit.SampleNoIntelligentTiering, 2)
+		add("No-Enc", r.Audit.SampleNoDefaultEncryption, 2)
+		add("Public", r.Audit.SamplePublicRisk, 2)
+		if len(lines) == 0 {
+			lines = append(lines, "None")
+		}
+
+		table.AddRow(
+			pterm.FgMagenta.Sprint(r.Profile),
+			r.AccountID,
+			fmt.Sprintf("%d", r.Audit.TotalBuckets),
+			fmt.Sprintf("%d", r.Audit.NoLifecycleCount),
+			fmt.Sprintf("%d", r.Audit.VersionedWithoutNoncurrentLifecycle),
+			fmt.Sprintf("%d", r.Audit.NoIntelligentTieringCount),
+			fmt.Sprintf("%d", r.Audit.NoDefaultEncryptionCount),
+			fmt.Sprintf("%d", r.Audit.PublicRiskCount),
+			strings.Join(lines, "\n"),
+		)
+	}
+	uc.console.Println("\n" + table.Render())
+
+	// Export
+	if args.ReportName != "" {
+		uc.console.LogInfo("Exporting S3 lifecycle audit reports...")
+		audits := make([]entity.S3LifecycleAudit, 0, len(results))
+		for _, r := range results {
+			if r.Err == nil {
+				audits = append(audits, r.Audit)
+			}
+		}
+		for _, reportType := range args.ReportType {
+			switch strings.ToLower(reportType) {
+			case "csv":
+				path, err := uc.exportRepo.ExportS3LifecycleAuditToCSV(audits, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export S3 lifecycle audit CSV: %v", err)
+				} else {
+					uc.console.LogSuccess("S3 lifecycle audit CSV saved to: %s", path)
+				}
+			case "json":
+				path, err := uc.exportRepo.ExportS3LifecycleAuditToJSON(audits, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export S3 lifecycle audit JSON: %v", err)
+				} else {
+					uc.console.LogSuccess("S3 lifecycle audit JSON saved to: %s", path)
+				}
+			case "pdf":
+				path, err := uc.exportRepo.ExportS3LifecycleAuditToPDF(audits, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export S3 lifecycle audit PDF: %v", err)
+				} else {
+					uc.console.LogSuccess("S3 lifecycle audit PDF saved to: %s", path)
+				}
+			}
+		}
+	}
+
 	return nil
 }

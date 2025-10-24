@@ -17,4 +17,5 @@ type CLIArgs struct {
 	BreakdownCosts bool
 	Transfer       bool
 	LogsAudit      bool
+	S3Audit        bool
 }

@@ -4,7 +4,6 @@ import (
 	"github.com/diillson/aws-finops-dashboard-go/internal/domain/entity"
 )
 
-// ExportRepository defines the interface for exporting data to different formats.
 type ExportRepository interface {
 	ExportToCSV(data []entity.ProfileData, filename string, outputDir string, previousPeriodDates, currentPeriodDates string) (string, error)
 	ExportToJSON(data []entity.ProfileData, filename string, outputDir string) (string, error)
@@ -23,4 +22,9 @@ type ExportRepository interface {
 	ExportLogsAuditToCSV(audits []entity.CloudWatchLogsAudit, filename, outputDir string) (string, error)
 	ExportLogsAuditToJSON(audits []entity.CloudWatchLogsAudit, filename, outputDir string) (string, error)
 	ExportLogsAuditToPDF(audits []entity.CloudWatchLogsAudit, filename, outputDir string) (string, error)
+
+	// S3 Lifecycle Audit
+	ExportS3LifecycleAuditToCSV(audits []entity.S3LifecycleAudit, filename, outputDir string) (string, error)
+	ExportS3LifecycleAuditToJSON(audits []entity.S3LifecycleAudit, filename, outputDir string) (string, error)
+	ExportS3LifecycleAuditToPDF(audits []entity.S3LifecycleAudit, filename, outputDir string) (string, error)
 }

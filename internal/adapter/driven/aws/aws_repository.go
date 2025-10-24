@@ -23,6 +23,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/diillson/aws-finops-dashboard-go/internal/domain/entity"
 	"github.com/diillson/aws-finops-dashboard-go/internal/domain/repository"
@@ -101,6 +103,10 @@ func (r *AWSRepositoryImpl) getServiceClient(ctx context.Context, profile, regio
 		client = sts.NewFromConfig(regionalCfg)
 	case "ec2":
 		client = ec2.NewFromConfig(regionalCfg)
+	case "s3":
+		client = s3.NewFromConfig(regionalCfg)
+	case "cloudwatchlogs":
+		client = cloudwatchlogs.NewFromConfig(regionalCfg)
 	case "costexplorer":
 		regionalCfg.Region = "us-east-1"
 		client = costexplorer.NewFromConfig(regionalCfg)
@@ -1220,4 +1226,203 @@ func (r *AWSRepositoryImpl) GetCloudWatchLogGroups(ctx context.Context, profile 
 	}
 	wg.Wait()
 	return result, nil
+}
+
+// GetS3LifecycleStatus coleta status de lifecycle/versioning/intelligent-tiering para todos os buckets,
+// além de criptografia padrão, public access block e heurística de exposição pública.
+//
+// Estratégia:
+// - ListBuckets (cliente s3 em us-east-1)
+// - Para cada bucket:
+//   - GetBucketLocation para descobrir a região (mapa "" -> us-east-1)
+//   - Com cliente regional:
+//   - GetBucketVersioning (Versioning/MFA Delete)
+//   - GetBucketLifecycleConfiguration (regras + Noncurrent + IT via lifecycle)
+//   - ListBucketIntelligentTieringConfigurations (IT configs explícitas)
+//   - GetBucketEncryption (default encryption SSE-S3/KMS)
+//   - GetPublicAccessBlock (flags de PAB)
+//   - GetBucketAcl + GetBucketPolicy (heurística de exposição pública)
+func (r *AWSRepositoryImpl) GetS3LifecycleStatus(ctx context.Context, profile string) ([]entity.S3BucketLifecycleStatus, error) {
+	// Cliente S3 "global" (us-east-1)
+	clientIntf, err := r.getServiceClient(ctx, profile, "us-east-1", "s3")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create S3 client: %w", err)
+	}
+	s3Global := clientIntf.(*s3.Client)
+
+	// Lista buckets
+	listOut, err := s3Global.ListBuckets(ctx, &s3.ListBucketsInput{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list S3 buckets: %w", err)
+	}
+	if len(listOut.Buckets) == 0 {
+		return nil, nil
+	}
+
+	type work struct {
+		Bucket string
+	}
+	jobs := make(chan work, len(listOut.Buckets))
+	results := make(chan entity.S3BucketLifecycleStatus, len(listOut.Buckets))
+
+	// Worker pool para evitar throttling: 8 workers
+	const workers = 8
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				status := r.inspectBucketLifecycle(ctx, profile, s3Global, j.Bucket)
+				results <- status
+			}
+		}()
+	}
+
+	for _, b := range listOut.Buckets {
+		if b.Name == nil {
+			continue
+		}
+		jobs <- work{Bucket: *b.Name}
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+
+	out := make([]entity.S3BucketLifecycleStatus, 0, len(listOut.Buckets))
+	for s := range results {
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+// inspectBucketLifecycle executa a inspeção detalhada de um bucket.
+func (r *AWSRepositoryImpl) inspectBucketLifecycle(ctx context.Context, profile string, s3Global *s3.Client, bucket string) entity.S3BucketLifecycleStatus {
+	status := entity.S3BucketLifecycleStatus{
+		Bucket:                            bucket,
+		Region:                            "us-east-1", // default até apurarmos
+		HasLifecycle:                      false,
+		LifecycleRulesCount:               0,
+		HasNoncurrentLifecycle:            false,
+		VersioningEnabled:                 false,
+		VersioningMFADelete:               false,
+		HasIntelligentTieringCfg:          false,
+		HasIntelligentTieringViaLifecycle: false,
+		DefaultEncryptionEnabled:          false,
+		DefaultEncryptionAlgo:             "",
+		DefaultEncryptionKMSKey:           "",
+		BlockPublicAcls:                   false,
+		BlockPublicPolicy:                 false,
+		IgnorePublicAcls:                  false,
+		RestrictPublicBuckets:             false,
+		IsPublic:                          false,
+	}
+
+	// 1) Região do bucket
+	if locOut, err := s3Global.GetBucketLocation(ctx, &s3.GetBucketLocationInput{Bucket: &bucket}); err == nil {
+		region := "us-east-1"
+		if locOut.LocationConstraint != "" {
+			region = string(locOut.LocationConstraint)
+			if region == "" {
+				region = "us-east-1"
+			}
+		}
+		status.Region = region
+	}
+
+	// 2) Cliente regional
+	clientIntf, err := r.getServiceClient(ctx, profile, status.Region, "s3")
+	if err != nil {
+		return status
+	}
+	s3Regional := clientIntf.(*s3.Client)
+
+	// 3) Versioning
+	if vOut, err := s3Regional.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: &bucket}); err == nil && vOut != nil {
+		status.VersioningEnabled = vOut.Status == s3types.BucketVersioningStatusEnabled
+		if vOut.MFADelete == s3types.MFADeleteStatusEnabled {
+			status.VersioningMFADelete = true
+		}
+	}
+
+	// 4) Lifecycle
+	if lcOut, err := s3Regional.GetBucketLifecycleConfiguration(ctx, &s3.GetBucketLifecycleConfigurationInput{Bucket: &bucket}); err == nil && lcOut != nil {
+		if len(lcOut.Rules) > 0 {
+			status.HasLifecycle = true
+			status.LifecycleRulesCount = len(lcOut.Rules)
+			for _, rule := range lcOut.Rules {
+				// NoncurrentVersionExpiration ou Transition
+				if rule.NoncurrentVersionExpiration != nil && rule.NoncurrentVersionExpiration.NoncurrentDays != nil {
+					status.HasNoncurrentLifecycle = true
+				}
+				if len(rule.NoncurrentVersionTransitions) > 0 {
+					status.HasNoncurrentLifecycle = true
+				}
+				// Intelligent-Tiering via lifecycle transitions
+				for _, t := range rule.Transitions {
+					if t.StorageClass == s3types.TransitionStorageClassIntelligentTiering {
+						status.HasIntelligentTieringViaLifecycle = true
+					}
+				}
+			}
+		}
+	}
+
+	// 5) Intelligent-Tiering (configurações explícitas de IT)
+	if itOut, err := s3Regional.ListBucketIntelligentTieringConfigurations(ctx, &s3.ListBucketIntelligentTieringConfigurationsInput{
+		Bucket: &bucket,
+	}); err == nil && itOut != nil && len(itOut.IntelligentTieringConfigurationList) > 0 {
+		status.HasIntelligentTieringCfg = true
+	}
+
+	// 6) Default Encryption
+	if encOut, err := s3Regional.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: &bucket}); err == nil && encOut != nil {
+		if encOut.ServerSideEncryptionConfiguration != nil && len(encOut.ServerSideEncryptionConfiguration.Rules) > 0 {
+			status.DefaultEncryptionEnabled = true
+			rule := encOut.ServerSideEncryptionConfiguration.Rules[0]
+			if rule.ApplyServerSideEncryptionByDefault != nil {
+				sse := rule.ApplyServerSideEncryptionByDefault
+				if sse.SSEAlgorithm != "" {
+					status.DefaultEncryptionAlgo = string(sse.SSEAlgorithm)
+				}
+				if sse.KMSMasterKeyID != nil {
+					status.DefaultEncryptionKMSKey = *sse.KMSMasterKeyID
+				}
+			}
+		}
+	}
+
+	// 7) Public Access Block (bucket-level) — campos são *bool, converter com aws.ToBool
+	if pabOut, err := s3Regional.GetPublicAccessBlock(ctx, &s3.GetPublicAccessBlockInput{Bucket: &bucket}); err == nil && pabOut != nil && pabOut.PublicAccessBlockConfiguration != nil {
+		cfg := pabOut.PublicAccessBlockConfiguration
+		status.BlockPublicAcls = aws.ToBool(cfg.BlockPublicAcls)
+		status.BlockPublicPolicy = aws.ToBool(cfg.BlockPublicPolicy)
+		status.IgnorePublicAcls = aws.ToBool(cfg.IgnorePublicAcls)
+		status.RestrictPublicBuckets = aws.ToBool(cfg.RestrictPublicBuckets)
+	}
+
+	// 8) Heurística de exposição pública (ACL + Policy)
+	// 8.1 ACL: grants para AllUsers/AuthenticatedUsers
+	if aclOut, err := s3Regional.GetBucketAcl(ctx, &s3.GetBucketAclInput{Bucket: &bucket}); err == nil {
+		for _, g := range aclOut.Grants {
+			if g.Grantee == nil || g.Grantee.URI == nil || g.Permission == "" {
+				continue
+			}
+			uri := *g.Grantee.URI
+			if strings.Contains(uri, "AllUsers") || strings.Contains(uri, "AuthenticatedUsers") {
+				status.IsPublic = true
+				break
+			}
+		}
+	}
+	// 8.2 Policy: Principal="*" + Effect:Allow
+	if polOut, err := s3Regional.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{Bucket: &bucket}); err == nil && polOut != nil && polOut.Policy != nil {
+		pol := *polOut.Policy
+		if (strings.Contains(pol, `"Principal":"*"`) || strings.Contains(pol, `"Principal": "*"`) || strings.Contains(pol, `"AWS":"*"`) || strings.Contains(pol, `"AWS": "*"`)) &&
+			(strings.Contains(pol, `"Effect":"Allow"`) || strings.Contains(pol, `"Effect": "Allow"`)) {
+			status.IsPublic = true
+		}
+	}
+
+	return status
 }
