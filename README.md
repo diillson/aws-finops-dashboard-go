@@ -1,6 +1,6 @@
 # AWS FinOps Dashboard (Go) — CLI
 
-Uma CLI para visualizar e auditar custos na AWS (FinOps), com suporte a múltiplos perfis, combinação por conta, exportação de relatórios (CSV/JSON/PDF), análise de tendências e auditoria de otimizações (NAT Gateways caros, LBs ociosos, Volumes/EIPs sem uso, recursos sem tags etc.).
+Uma CLI para visualizar e auditar custos na AWS (FinOps), com suporte a múltiplos perfis, combinação por conta, exportação de relatórios (CSV/JSON/PDF), análise de tendências e auditoria de otimizações (NAT Gateways, LBs ociosos, recursos sem uso, S3 Lifecycle, SP/RI Coverage e mais).
 
 ---
 
@@ -8,20 +8,17 @@ Uma CLI para visualizar e auditar custos na AWS (FinOps), com suporte a múltipl
 - [Recursos (Features)](#recursos-features)
 - [Pré-requisitos](#pré-requisitos)
 - [Instalação e Build](#instalação-e-build)
-  - [Build com versão correta (ldflags)](#build-com-versão-correta-ldflags)
-  - [Makefile (opcional)](#makefile-opcional)
-- [Uso rápido](#uso-rápido)
+  - [Build com Makefile (Recomendado)](#build-com-makefile-recomendado)
+  - [Build Manual (ldflags)](#build-manual-ldflags)
+- [Uso Rápido](#uso-rápido)
 - [Flags da CLI](#flags-da-cli)
-- [Arquivo de configuração (TOML/YAML/JSON)](#arquivo-de-configuração-tomlyamljson)
-  - [Estrutura](#estrutura)
-  - [Exemplos](#exemplos)
-  - [Como usar e precedência](#como-usar-e-precedência)
-- [Casos de Uso (Exemplos práticos)](#casos-de-uso-exemplos-práticos)
+- [Arquivo de Configuração (TOML/YAML/JSON)](#arquivo-de-configuração-tomlyamljson)
+- [Casos de Uso (Exemplos Práticos)](#casos-de-uso-exemplos-práticos)
 - [Relatórios e Exportação](#relatórios-e-exportação)
-- [Fluxo interno e Arquitetura](#fluxo-interno-e-arquitetura)
-- [Permissões AWS necessárias](#permissões-aws-necessárias)
-- [Solução de problemas (Troubleshooting)](#solução-de-problemas-troubleshooting)
-- [Observações de desempenho](#observações-de-desempenho)
+- [Fluxo Interno e Arquitetura](#fluxo-interno-e-arquitetura)
+- [Permissões AWS Necessárias](#permissões-aws-necessárias)
+- [Solução de Problemas (Troubleshooting)](#solução-de-problemas-troubleshooting)
+- [Observações de Desempenho](#observações-de-desempenho)
 - [Segurança](#segurança)
 - [Screenshots](#screenshots)
 - [Licença e Créditos](#licença-e-créditos)
@@ -30,122 +27,113 @@ Uma CLI para visualizar e auditar custos na AWS (FinOps), com suporte a múltipl
 
 ## Recursos (Features)
 
-- Dashboard de custos por perfil/conta com:
-  - Custo do período anterior vs atual e variação percentual
-  - Custos por serviço, com detalhamento opcional (usage-type) para serviços como Data Transfer, EC2-Other e VPC
-  - Sumário de instâncias EC2 por estado
-  - Status de Budgets (limite, atual, forecast)
-- Combinação por conta com `--combine`
-- Filtros por tags de alocação (`--tag`)
-- Período personalizável (`--time-range`)
-- Análise de tendências (últimos 6 meses) com `--trend`
-- Auditoria de otimização (`--audit`):
-  - NAT Gateways com alto custo
-  - Load Balancers ociosos
-  - Volumes EBS e EIPs sem uso
-  - EC2 paradas
-  - Recursos sem tags (EC2, RDS, Lambda)
-  - VPC Endpoints (Interface) sem uso
-  - Alertas de Budget
-- Exportação: CSV, JSON e PDF
-- Configurações via TOML, YAML ou JSON
-- Verificação de atualização via GitHub Releases
-- Interface rica no terminal (pterm): banner, progress bar, tabelas etc.
+- **Dashboard de Custos**:
+  - Custo do período anterior vs. atual e variação percentual.
+  - Custos por serviço, com detalhamento opcional (`--breakdown-costs`).
+  - Sumário de instâncias EC2 por estado.
+  - Status de Budgets (limite, atual, forecast).
+- **Análise de Tendências** (`--trend`): Gráfico de custos dos últimos 6 meses.
+- **Auditoria Abrangente** (`--full-audit`):
+  - **Auditoria Principal** (`--audit`):
+    - NAT Gateways com alto custo.
+    - Load Balancers ociosos.
+    - Volumes EBS e EIPs sem uso.
+    - EC2 paradas.
+    - Recursos sem tags (EC2, RDS, Lambda).
+    - VPC Endpoints (Interface) sem uso.
+  - **Auditoria de Data Transfer** (`--transfer`):
+    - Detalhamento de custos por categoria (Internet, Inter-Region, Cross-AZ, NAT).
+    - Identificação dos principais serviços e tipos de uso que geram custos.
+  - **Auditoria de CloudWatch Logs** (`--logs-audit`):
+    - Identificação de Log Groups sem política de retenção (`Never Expire`).
+    - Ordenação por tamanho para priorizar ações.
+  - **Auditoria de S3** (`--s3-audit`):
+    - Buckets sem política de Lifecycle.
+    - Buckets com versionamento ativo sem regra para versões antigas.
+    - Checagem de criptografia padrão.
+    - Análise de configuração de acesso público (Public Access Block e heurísticas).
+  - **Auditoria de Compromissos** (`--commitments`):
+    - Análise de cobertura e utilização de Savings Plans (SP).
+    - Análise de cobertura e utilização de Reserved Instances (RI).
+- **Exportação Flexível**: CSV, JSON e PDF para todos os relatórios.
+- **Configuração Simplificada**: Suporte a arquivos de configuração TOML, YAML ou JSON.
+- **Interface Rica no Terminal**: Banner, barras de progresso paralelas (`pterm`), tabelas e gráficos.
 
 ---
 
 ## Pré-requisitos
 
-- Go **1.24+** (recomendado)
-- AWS CLI configurado com credenciais válidas
-- **Cost Explorer** habilitado
-- Permissões de IAM adequadas ([ver abaixo](#permissões-aws-necessárias))
+- Go **1.24+** (recomendado).
+- AWS CLI configurado com credenciais válidas.
+- **Cost Explorer** habilitado na conta AWS.
+- Permissões de IAM adequadas ([ver abaixo](#permissões-aws-necessárias)).
 
 ---
 
 ## Instalação e Build
 
 Clone o repositório:
-
 ```bash
 git clone https://github.com/diillson/aws-finops-dashboard-go.git
 cd aws-finops-dashboard-go
 ````
 
-Build básico:
+### Build com Makefile (Recomendado)
 
-```bash
-go build -o bin/aws-finops ./cmd/aws-finops
-```
+O projeto inclui um `Makefile` que automatiza a injeção de informações de versão a partir do Git.
 
-Executável:
-
-```bash
-./bin/aws-finops --help
-```
-
-### Build com versão correta (ldflags)
-
-Linux/macOS:
-
-```bash
-go build -ldflags "-s -w \
-  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.Version=1.2.0 \
-  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.Commit=$(git rev-parse --short HEAD) \
-  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  -o bin/aws-finops ./cmd/aws-finops
-```
-
-Windows (PowerShell):
-
-```powershell
-$commit = git rev-parse --short HEAD
-$buildTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-go build -ldflags "-s -w `
-  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.Version=1.2.3 `
-  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.Commit=$commit `
-  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.BuildTime=$buildTime" `
-  -o bin/aws-finops ./cmd/aws-finops
-```
-
-Ao iniciar, verá algo como:
-
-```
-AWS FinOps Dashboard CLI (v1.2.0 (commit: abc1234, built at: 2025-10-23T10:20:30Z))
-```
-
-Sem `-ldflags`, o padrão é:
-
-```
-AWS FinOps Dashboard CLI (v0.0.0-dev (development))
-```
-
----
-
-### Makefile (opcional)
-
-O projeto inclui um Makefile para simplificar o build.
-
-Uso:
+**Build de Produção:**
 
 ```bash
 make build
-./bin/aws-finops --version
+```
+
+O binário será gerado em `./bin/aws-finops`.
+
+**Build de Desenvolvimento (rápido, sem ldflags):**
+
+```bash
+make build-dev
+```
+
+### Build Manual (ldflags)
+
+Se preferir, você pode compilar manualmente. Use `-ldflags` para embutir a versão correta.
+
+**Linux/macOS:**
+
+```bash
+VERSION=$(git describe --tags --abbrev=0)
+COMMIT=$(git rev-parse --short HEAD)
+BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+go build -ldflags "-s -w \
+  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.Version=${VERSION} \
+  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.Commit=${COMMIT} \
+  -X github.com/diillson/aws-finops-dashboard-go/pkg/version.BuildTime=${BUILD_TIME}" \
+  -o bin/aws-finops ./cmd/aws-finops
 ```
 
 ---
 
-## Uso rápido
+## Uso Rápido
 
 ```bash
-aws-finops --help
-aws-finops --version
-aws-finops -p my-prod
-aws-finops --all
-aws-finops --all --combine
-aws-finops -p prod -g Environment=Production -n finops-report -y csv -y pdf -d ./reports
-aws-finops -p prod --trend
-aws-finops --all --audit -n audit-$(date +%Y%m%d) -y pdf -d ./audits
+# Ajuda e versão
+./bin/aws-finops --help
+./bin/aws-finops --version
+
+# Dashboard de custos para um perfil específico
+./bin/aws-finops -p meu-perfil-prod
+
+# Auditoria completa para todas as contas, com exportação
+./bin/aws-finops --all --combine --full-audit -n full-audit-$(date +%Y%m%d) -y pdf -y json -d ./reports
+
+# Análise de tendência de custos dos últimos 6 meses
+./bin/aws-finops -p meu-perfil-prod --trend
+
+# Auditoria específica de S3
+./bin/aws-finops -p meu-perfil-prod --s3-audit
 ```
 
 ---
@@ -164,53 +152,38 @@ aws-finops --all --audit -n audit-$(date +%Y%m%d) -y pdf -d ./audits
 -t, --time-range int       Intervalo em dias (padrão: mês corrente)
 -g, --tag strings          Filtro por tag (ex: Team=DevOps)
 --trend                    Análise de tendência (6 meses)
---audit                    Auditoria de otimização
+--audit                    Auditoria principal (recursos ociosos/sem tag)
+--transfer                 Auditoria de custos de Data Transfer
+--logs-audit               Auditoria de retenção de CloudWatch Logs
+--s3-audit                 Auditoria de S3 (Lifecycle, Segurança)
+--commitments              Auditoria de Savings Plans e RIs
+--full-audit               Executa todas as auditorias em sequência
 --breakdown-costs          Detalhamento de custos (usage-type)
 --version                  Mostra a versão
 --help                     Ajuda
 ```
 
+Flags de linha de comando sobrescrevem as configurações do arquivo de configuração.
+
 ---
 
-## Arquivo de configuração (TOML/YAML/JSON)
+## Arquivo de Configuração (TOML/YAML/JSON)
 
-### Estrutura
-
-```go
-type Config struct {
-  Profiles   []string `json:"profiles" yaml:"profiles" toml:"profiles"`
-  Regions    []string `json:"regions" yaml:"regions" toml:"regions"`
-  Combine    bool     `json:"combine" yaml:"combine" toml:"combine"`
-  ReportName string   `json:"report_name" yaml:"report_name" toml:"report_name"`
-  ReportType []string `json:"report_type" yaml:"report_type" toml:"report_type"`
-  Dir        string   `json:"dir" yaml:"dir" toml:"dir"`
-  TimeRange  int      `json:"time_range" yaml:"time_range" toml:"time_range"`
-  Tag        []string `json:"tag" yaml:"tag" toml:"tag"`
-  Audit      bool     `json:"audit" yaml:"audit" toml:"audit"`
-  Trend      bool     `json:"trend" yaml:"trend" toml:"trend"`
-  All        bool     `json:"all" yaml:"all" toml:"all"`
-}
-```
-
-### Exemplos
-
-**TOML**
+Você pode centralizar suas configurações em um arquivo para facilitar o uso.
+Exemplo de `config.toml`:
 
 ```toml
-profiles = ["production", "development", "data-warehouse"]
-regions = ["us-east-1", "us-west-2", "eu-central-1"]
+profiles = ["production", "development"]
+regions = ["us-east-1", "us-west-2"]
 combine = true
 report_name = "aws-finops-monthly"
-report_type = ["csv", "pdf"]
+report_type = ["pdf", "json"]
 dir = "/home/user/reports/aws"
 time_range = 30
-tag = ["Environment=Production", "Department=IT"]
-audit = false
-trend = false
+tag = ["Environment=Production"]
 ```
 
-**YAML**
-
+YAML
 ```yaml
 profiles:
   - production
@@ -230,8 +203,7 @@ audit: false
 trend: false
 ```
 
-**JSON**
-
+JSON
 ```json
 {
   "profiles": ["production", "development", "data-warehouse"],
@@ -245,144 +217,185 @@ trend: false
   "audit": false,
   "trend": false
 }
-```
+```  
 
-### Como usar e precedência
+Uso:
 
 ```bash
-aws-finops --config-file /path/config.yaml
+./bin/aws-finops --config-file config.toml --full-audit
 ```
-
-Flags de linha de comando **sobrescrevem** as do arquivo.
 
 ---
 
-## Casos de Uso (Exemplos práticos)
+## Casos de Uso (Exemplos Práticos)
+
+Gerar um relatório de auditoria completo e abrangente para todas as contas:
 
 ```bash
-aws-finops --all --combine -n monthly-costs -y csv -y pdf -d ./reports
-aws-finops -p prod -p staging --audit -r us-east-1 -r eu-west-1 -n audit-jan -y pdf -d ./audits
-aws-finops -p prod --trend -g Department=Engineering -t 180
-aws-finops -p prod --breakdown-costs -n finops-dt -y json -y pdf -d ./reports
-aws-finops -C config.yaml --report-name override --trend
+./bin/aws-finops --all --combine --full-audit \
+  -n full-audit-report-$(date +%Y%m%d) \
+  -y pdf -y json \
+  -d ./reports/audits
+```
+
+Analisar a cobertura de Savings Plans e RIs nos últimos 60 dias:
+
+```bash
+./bin/aws-finops -p payer-account --commitments -t 60
+```
+
+Investigar custos de transferência de dados para a equipe de "Payments":
+
+```bash
+./bin/aws-finops -p prod --transfer -g Team=Payments
+```
+
+Verificar a higiene dos buckets S3 em todas as contas:
+
+```bash
+./bin/aws-finops --all --s3-audit
 ```
 
 ---
 
 ## Relatórios e Exportação
 
-* Tipos suportados: `csv`, `json`, `pdf`
-* Dashboard:
+* **Formatos Suportados:** `csv`, `json`, `pdf`
+* **Relatório de Auditoria Completa (`--full-audit`):**
 
-    * Colunas: Conta, períodos, custos por serviço, Budget, EC2
-* Auditoria:
+    * **JSON:** Um único arquivo com a estrutura aninhada de todos os relatórios.
+    * **PDF:** Um único documento com uma página de rosto e “capítulos” para cada auditoria.
+    * **CSV:** Um pacote de arquivos (`..._main.csv`, `..._transfer.csv`, etc.), um para cada tipo de auditoria.
 
-    * Colunas: Conta, Budget, NAT Gateway, EBS, EC2, LBs, Tags
-* Exemplo:
+---
 
-```bash
-aws-finops -p prod -n report-name -y csv -y json -y pdf -d ./out
+## Fluxo Interno e Arquitetura
+
+O projeto segue a **Arquitetura Hexagonal (Ports & Adapters)**:
+
+* **Domain:** Entidades de negócio e interfaces (ports).
+* **Application:** Casos de uso que orquestram a lógica.
+* **Adapters:**
+
+    * Driven (Saída): AWS SDK, exportação de arquivos, leitura de configuração.
+    * Driving (Entrada): CLI (Cobra).
+
+---
+
+## Permissões AWS Necessárias
+
+Para que a ferramenta funcione com todos os recursos, a role ou usuário IAM precisa das seguintes permissões de leitura:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BasePermissions",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "ec2:DescribeRegions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CostExplorerAndBudgets",
+      "Effect": "Allow",
+      "Action": [
+        "ce:GetCostAndUsage",
+        "ce:GetReservationCoverage",
+        "ce:GetReservationUtilization",
+        "ce:GetSavingsPlansCoverage",
+        "ce:GetSavingsPlansUtilization",
+        "budgets:DescribeBudgets"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ResourceInventoryAndAudit",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeAddresses",
+        "ec2:DescribeVpcEndpoints",
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth",
+        "rds:DescribeDBInstances",
+        "lambda:ListFunctions",
+        "lambda:ListTags"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3Audit",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListAllMyBuckets",
+        "s3:GetBucketLocation",
+        "s3:GetBucketVersioning",
+        "s3:GetBucketLifecycleConfiguration",
+        "s3:ListBucketIntelligentTieringConfigurations",
+        "s3:GetBucketEncryption",
+        "s3:GetPublicAccessBlock",
+        "s3:GetBucketAcl",
+        "s3:GetBucketPolicy"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudWatchLogsAudit",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DescribeLogGroups"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
 ```
 
 ---
 
-## Fluxo interno e Arquitetura
+## Solução de Problemas (Troubleshooting)
 
-**Arquitetura Hexagonal (Ports & Adapters):**
-
-* Domain: entidades e interfaces
-* Application: casos de uso
-* Adapters:
-
-    * driven: AWS SDK, exportação, config
-    * driving: CLI (cobra)
-
-**Principais componentes:**
-
-* `cmd/aws-finops/main.go`
-* `internal/adapter/driving/cli`
-* `internal/application/usecase`
-* `internal/adapter/driven/aws`
-* `pkg/console`
-* `pkg/version`
-
-Fluxo:
-
-1. Inicializa CLI e casos de uso
-2. Lê config/flags
-3. Executa dashboard/auditoria/tendência
-4. Exibe no terminal e exporta relatórios
-5. Verifica atualização (ignorada em `-dev`)
+* `No AWS profiles found`: Configure a AWS CLI com `aws configure --profile <nome>`.
+* `credential validation failed`: Renove suas credenciais (ex: `aws sso login`).
+* `DataUnavailableException`: Comum em contas-membro para relatórios de SP/RI. Execute na conta *payer* para obter dados completos.
+* `AccessDenied`: Verifique se a política IAM possui todas as permissões listadas acima.
+* Versão incorreta: Use `make build` para garantir que a versão do Git seja embutida corretamente.
 
 ---
 
-## Permissões AWS necessárias
+## Observações de Desempenho
 
-**Dashboard e tendência:**
-
-```
-ce:GetCostAndUsage
-budgets:DescribeBudgets
-ec2:DescribeInstances
-ec2:DescribeRegions
-sts:GetCallerIdentity
-```
-
-**Auditoria:**
-
-```
-ec2:DescribeVolumes
-ec2:DescribeAddresses
-rds:DescribeDBInstances
-lambda:ListFunctions
-elasticloadbalancing:DescribeLoadBalancers
-elasticloadbalancing:DescribeTargetGroups
-elasticloadbalancing:DescribeTargetHealth
-```
-
----
-
-## Solução de problemas (Troubleshooting)
-
-* `No AWS profiles found`: configure com `aws configure --profile <nome>`
-* `credential validation failed`: renove STS/SSO
-* Cost Explorer vazio: habilite-o na conta
-* `AccessDenied`: ajuste políticas IAM
-* PDF cortado: use JSON/CSV
-* Versão incorreta: use `-ldflags` no build
-
----
-
-## Observações de desempenho
-
-* Processamento concorrente com worker pool
-* Feedback visual com `pterm.MultiPrinter`
-* Cache de clientes AWS
-* `--combine` reduz chamadas redundantes
+* **Processamento Concorrente:** Utiliza um pool de workers para auditar múltiplos perfis e regiões em paralelo.
+* **Feedback Visual:** Barras de progresso paralelas (`pterm.MultiPrinter`) fornecem feedback claro sem poluir o terminal.
+* **Cache de Clientes AWS:** Clientes do SDK são cacheados para reutilização, reduzindo a sobrecarga de inicialização.
+* **`--combine`:** Reduz chamadas de API redundantes para perfis que compartilham a mesma conta AWS.
 
 ---
 
 ## Segurança
 
-* Sem logging de credenciais
-* Usa perfis padrão da AWS CLI
-* Princípio de menor privilégio
+* A ferramenta **não armazena nem faz log de credenciais**.
+* Utiliza os perfis e mecanismos de autenticação padrão da AWS CLI.
+* A política IAM recomendada segue o **princípio de menor privilégio (somente leitura)**.
 
 ---
 
 ## Screenshots
 
 **Dashboard**
-
-![Dashboard](./img/aws-finops-dashboard-go-v1.png)
+![Dashboard](/img/aws-finops-dashboard-go-v1.png)
 
 **Tendência**
-
-![Trend](./img/aws-finops-dashboard-go-trend.png)
+![Trend](/img/aws-finops-dashboard-go-trend.png)
 
 **Auditoria**
-
-![Audit](./img/aws-finops-dashboard-go-audit-report.png)
+![Audit](/img/aws-finops-dashboard-go-audit-report.png)
 
 ---
 
@@ -392,9 +405,9 @@ Inspirado em:
 
 * [ravikiranvm/aws-finops-dashboard](https://github.com/ravikiranvm/aws-finops-dashboard) (Python)
 
-Licença: **MIT**
+**Licença:** MIT
 
-Port Go e melhorias:
+Port para Go e melhorias:
 
 * [diillson/aws-finops-dashboard-go](https://github.com/diillson/aws-finops-dashboard-go)
 
