@@ -46,7 +46,9 @@ func NewCLIApp(versionStr string) *CLIApp {
 	rootCmd.PersistentFlags().Bool("breakdown-costs", false, "Show a detailed cost breakdown for services like Data Transfer.")
 	rootCmd.PersistentFlags().Bool("transfer", false, "Display a Data Transfer Deep Dive report")
 	rootCmd.PersistentFlags().Bool("logs-audit", false, "Display a CloudWatch Logs Retention Audit report")
-	rootCmd.PersistentFlags().Bool("s3-audit", false, "Display an S3 Lifecycle Audit report") // <-- NOVO
+	rootCmd.PersistentFlags().Bool("s3-audit", false, "Display an S3 Lifecycle Audit report")
+	rootCmd.PersistentFlags().Bool("commitments", false, "Display Savings Plans/RI Coverage & Utilization report")
+	rootCmd.PersistentFlags().Bool("full-audit", false, "Run all audit reports sequentially (audit, transfer, logs, s3, commitments)")
 
 	app.rootCmd = rootCmd
 	return app
@@ -74,7 +76,9 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 	breakdownCosts, _ := app.rootCmd.Flags().GetBool("breakdown-costs")
 	transfer, _ := app.rootCmd.Flags().GetBool("transfer")
 	logsAudit, _ := app.rootCmd.Flags().GetBool("logs-audit")
-	s3Audit, _ := app.rootCmd.Flags().GetBool("s3-audit") // <-- NOVO
+	s3Audit, _ := app.rootCmd.Flags().GetBool("s3-audit")
+	commitments, _ := app.rootCmd.Flags().GetBool("commitments")
+	fullAudit, _ := app.rootCmd.Flags().GetBool("full-audit")
 
 	if dir == "" {
 		cwd, err := os.Getwd()
@@ -112,6 +116,8 @@ func (app *CLIApp) parseArgs() (*types.CLIArgs, error) {
 		Transfer:       transfer,
 		LogsAudit:      logsAudit,
 		S3Audit:        s3Audit,
+		Commitments:    commitments,
+		FullAudit:      fullAudit,
 	}
 	return args, nil
 }

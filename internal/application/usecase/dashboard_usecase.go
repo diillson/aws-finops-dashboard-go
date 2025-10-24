@@ -52,15 +52,21 @@ func (uc *DashboardUseCase) RunDashboard(ctx context.Context, args *types.CLIArg
 		return nil
 	}
 
-	// Ordem de prioridade dos relatórios específicos
+	// Ordem de prioridade de relatórios específicos
 	if args.S3Audit {
 		return uc.runS3LifecycleAudit(ctx, profileGroups, args)
 	}
 	if args.LogsAudit {
 		return uc.runCloudWatchLogsAudit(ctx, profileGroups, args)
 	}
+	if args.Commitments {
+		return uc.runCommitmentsReport(ctx, profileGroups, args)
+	}
 	if args.Audit {
 		return uc.runAuditReport(ctx, profileGroups, args)
+	}
+	if args.FullAudit {
+		return uc.runFullAuditReport(ctx, profileGroups, args)
 	}
 	if args.Trend {
 		return uc.runTrendAnalysis(ctx, profileGroups, args)
@@ -1485,6 +1491,516 @@ func (uc *DashboardUseCase) runS3LifecycleAudit(ctx context.Context, profileGrou
 					uc.console.LogError("Failed to export S3 lifecycle audit PDF: %v", err)
 				} else {
 					uc.console.LogSuccess("S3 lifecycle audit PDF saved to: %s", path)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (uc *DashboardUseCase) runCommitmentsReport(ctx context.Context, profileGroups []entity.ProfileGroup, args *types.CLIArgs) error {
+	uc.console.LogInfo("Analysing Savings Plans / Reserved Instances coverage & utilization...")
+
+	livePrinter, _ := uc.console.GetMultiPrinter().Start()
+	defer livePrinter.Stop()
+
+	type row struct {
+		Profile string
+		Report  entity.CommitmentsReport
+		Err     error
+	}
+	results := make([]row, 0, len(profileGroups))
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, group := range profileGroups {
+		wg.Add(1)
+		go func(g entity.ProfileGroup) {
+			defer wg.Done()
+			bar := uc.console.NewProgressbar(2, fmt.Sprintf("Commitments: %s", g.Identifier))
+			bar.Start()
+
+			profile := g.Profiles[0]
+
+			var timeRange *int
+			if args.TimeRange != nil && *args.TimeRange > 0 {
+				timeRange = args.TimeRange
+			}
+
+			sp, err1 := uc.awsRepo.GetSavingsPlansSummary(ctx, profile, timeRange, args.Tag)
+			bar.Increment()
+			ri, err2 := uc.awsRepo.GetReservationSummary(ctx, profile, timeRange, args.Tag)
+			bar.Increment()
+
+			if err1 != nil {
+				mu.Lock()
+				results = append(results, row{
+					Profile: g.Identifier,
+					Err:     fmt.Errorf("SP error: %w", err1),
+				})
+				mu.Unlock()
+				return
+			}
+			if err2 != nil {
+				mu.Lock()
+				results = append(results, row{
+					Profile: g.Identifier,
+					Err:     fmt.Errorf("RI error: %w", err2),
+				})
+				mu.Unlock()
+				return
+			}
+
+			rep := entity.CommitmentsReport{
+				AccountID:  sp.AccountID,
+				Profile:    g.Identifier,
+				SPSummary:  sp,
+				RISummary:  ri,
+				PeriodName: sp.PeriodName,
+			}
+
+			mu.Lock()
+			results = append(results, row{
+				Profile: g.Identifier,
+				Report:  rep,
+			})
+			mu.Unlock()
+		}(group)
+	}
+	wg.Wait()
+
+	sort.Slice(results, func(i, j int) bool { return results[i].Profile < results[j].Profile })
+
+	// Monta tabela
+	table := uc.console.CreateTable()
+	table.AddColumn("Profile")
+	table.AddColumn("Account ID")
+	table.AddColumn("Period")
+	table.AddColumn("SP Coverage %")
+	table.AddColumn("SP Util %")
+	table.AddColumn("SP Unused ($)")
+	table.AddColumn("RI Coverage %")
+	table.AddColumn("RI Util %")
+	table.AddColumn("RI Unused (hrs)")
+
+	for _, r := range results {
+		if r.Err != nil {
+			table.AddRow(
+				pterm.FgMagenta.Sprint(r.Profile),
+				"N/A",
+				"N/A",
+				pterm.FgRed.Sprintf("Error: %v", r.Err),
+				"-", "-", "-", "-", "-",
+			)
+			continue
+		}
+		rep := r.Report
+		period := fmt.Sprintf("%s to %s", rep.SPSummary.PeriodStart.Format("2006-01-02"), rep.SPSummary.PeriodEnd.Format("2006-01-02"))
+
+		spCoverage := fmt.Sprintf("%.2f%%", rep.SPSummary.CoveragePercent)
+		spUtil := fmt.Sprintf("%.2f%%", rep.SPSummary.UtilizationPercent)
+		spUnused := fmt.Sprintf("$%.2f", rep.SPSummary.UnusedCommitment)
+		if rep.SPSummary.DataUnavailable {
+			spCoverage = "Data Unavailable"
+			spUtil = "Data Unavailable"
+			spUnused = "Data Unavailable"
+		}
+
+		riCoverage := fmt.Sprintf("%.2f%%", rep.RISummary.CoveragePercent)
+		riUtil := fmt.Sprintf("%.2f%%", rep.RISummary.UtilizationPercent)
+		riUnused := fmt.Sprintf("%.2f", rep.RISummary.UnusedHours)
+		if rep.RISummary.DataUnavailable {
+			riCoverage = "Data Unavailable"
+			riUtil = "Data Unavailable"
+			riUnused = "Data Unavailable"
+		}
+
+		table.AddRow(
+			pterm.FgMagenta.Sprint(rep.Profile),
+			rep.AccountID,
+			period,
+			spCoverage,
+			spUtil,
+			spUnused,
+			riCoverage,
+			riUtil,
+			riUnused,
+		)
+	}
+	uc.console.Println("\n" + table.Render())
+
+	// Exibir Top “gaps” por serviço para SP e RI (opcional curto)
+	const maxLines = 5
+	for _, r := range results {
+		if r.Err != nil {
+			continue
+		}
+		rep := r.Report
+		uc.console.Println(pterm.FgYellow.Sprintf("\nTop SP On-Demand by Service — %s", r.Profile))
+		spList := rep.SPSummary.PerServiceCoverage
+		if len(spList) == 0 {
+			uc.console.Println("  None")
+		} else {
+			limit := len(spList)
+			if limit > maxLines {
+				limit = maxLines
+			}
+			for i := 0; i < limit; i++ {
+				l := spList[i]
+				uc.console.Println(fmt.Sprintf("  - %s: coverage %.2f%%, OnDemand $%.2f", l.Service, l.CoveragePercent, l.OnDemandCost))
+			}
+			if len(spList) > limit {
+				uc.console.Println(fmt.Sprintf("  ... (+%d more)", len(spList)-limit))
+			}
+		}
+
+		uc.console.Println(pterm.FgYellow.Sprintf("\nTop RI On-Demand by Service — %s", r.Profile))
+		riList := rep.RISummary.PerServiceCoverage
+		if len(riList) == 0 {
+			uc.console.Println("  None")
+		} else {
+			limit := len(riList)
+			if limit > maxLines {
+				limit = maxLines
+			}
+			for i := 0; i < limit; i++ {
+				l := riList[i]
+				uc.console.Println(fmt.Sprintf("  - %s: coverage %.2f%%, OnDemand Hrs %.2f", l.Service, l.CoveragePercent, l.OnDemandCost))
+			}
+			if len(riList) > limit {
+				uc.console.Println(fmt.Sprintf("  ... (+%d more)", len(riList)-limit))
+			}
+		}
+	}
+
+	// Export
+	if args.ReportName != "" {
+		uc.console.LogInfo("Exporting commitments reports...")
+		reports := make([]entity.CommitmentsReport, 0, len(results))
+		for _, r := range results {
+			if r.Err == nil {
+				reports = append(reports, r.Report)
+			}
+		}
+		for _, reportType := range args.ReportType {
+			switch strings.ToLower(reportType) {
+			case "csv":
+				path, err := uc.exportRepo.ExportCommitmentsReportToCSV(reports, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export commitments CSV: %v", err)
+				} else {
+					uc.console.LogSuccess("Commitments CSV saved to: %s", path)
+				}
+			case "json":
+				path, err := uc.exportRepo.ExportCommitmentsReportToJSON(reports, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export commitments JSON: %v", err)
+				} else {
+					uc.console.LogSuccess("Commitments JSON saved to: %s", path)
+				}
+			case "pdf":
+				path, err := uc.exportRepo.ExportCommitmentsReportToPDF(reports, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export commitments PDF: %v", err)
+				} else {
+					uc.console.LogSuccess("Commitments PDF saved to: %s", path)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+func (uc *DashboardUseCase) runFullAuditReport(ctx context.Context, profileGroups []entity.ProfileGroup, args *types.CLIArgs) error {
+	uc.console.LogInfo("Running Full Audit...")
+
+	livePrinter, _ := uc.console.GetMultiPrinter().Start()
+	defer livePrinter.Stop()
+
+	type row struct {
+		Profile string
+		Report  entity.FullAuditReport
+		Err     error
+	}
+	results := make([]row, 0, len(profileGroups))
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for _, group := range profileGroups {
+		wg.Add(1)
+		go func(g entity.ProfileGroup) {
+			defer wg.Done()
+			const totalSteps = 6 // Main Audit, Transfer, Logs, S3, SP, RI
+			bar := uc.console.NewProgressbar(totalSteps, fmt.Sprintf("Full Audit: %s", g.Identifier))
+			bar.Start()
+
+			profile := g.Profiles[0]
+			accountID, _ := uc.awsRepo.GetAccountID(ctx, profile)
+			report := entity.FullAuditReport{Profile: g.Identifier, AccountID: accountID}
+
+			var innerWg sync.WaitGroup
+			innerWg.Add(totalSteps)
+
+			// 1. Main Audit
+			go func() {
+				defer innerWg.Done()
+				defer bar.Increment()
+				regions := args.Regions
+				if len(regions) == 0 {
+					regions, _ = uc.awsRepo.GetAccessibleRegions(ctx, profile)
+				}
+				natCosts, _ := uc.awsRepo.GetNatGatewayCost(ctx, profile, args.TimeRange, args.Tag)
+				idleLBs, _ := uc.awsRepo.GetIdleLoadBalancers(ctx, profile, regions)
+				stopped, _ := uc.awsRepo.GetStoppedInstances(ctx, profile, regions)
+				unusedVols, _ := uc.awsRepo.GetUnusedVolumes(ctx, profile, regions)
+				unusedEIPs, _ := uc.awsRepo.GetUnusedEIPs(ctx, profile, regions)
+				untagged, _ := uc.awsRepo.GetUntaggedResources(ctx, profile, regions)
+				unusedEndpoints, _ := uc.awsRepo.GetUnusedVpcEndpoints(ctx, profile, regions)
+				budgets, _ := uc.awsRepo.GetBudgets(ctx, profile)
+
+				report.MainAudit = &entity.AuditData{
+					Profile:            g.Identifier,
+					AccountID:          accountID,
+					NatGatewayCosts:    formatNatGatewayCosts(natCosts),
+					IdleLoadBalancers:  formatAuditMap(idleLBs, "Idle Load Balancers"),
+					StoppedInstances:   formatAuditMap(stopped, "Stopped Instances"),
+					UnusedVolumes:      formatAuditMap(unusedVols, "Unused Volumes"),
+					UnusedEIPs:         formatAuditMap(unusedEIPs, "Unused Elastic IPs"),
+					UntaggedResources:  formatAuditMapForUntagged(untagged),
+					UnusedVpcEndpoints: formatAuditMap(unusedEndpoints, "Unused VPC Endpoints"),
+					BudgetAlerts:       formatBudgetAlerts(budgets),
+				}
+			}()
+
+			// 2. Transfer Audit
+			go func() {
+				defer innerWg.Done()
+				defer bar.Increment()
+				if transfer, err := uc.awsRepo.GetDataTransferBreakdown(ctx, profile, args.TimeRange, args.Tag); err == nil {
+					report.TransferAudit = &transfer
+				}
+			}()
+
+			// 3. Logs Audit
+			go func() {
+				defer innerWg.Done()
+				defer bar.Increment()
+				regions := args.Regions
+				if len(regions) == 0 {
+					regions, _ = uc.awsRepo.GetAccessibleRegions(ctx, profile)
+				}
+				if logGroups, err := uc.awsRepo.GetCloudWatchLogGroups(ctx, profile, regions); err == nil {
+					noRetention := make([]entity.CloudWatchLogGroupInfo, 0)
+					var totalBytes int64
+					for _, lg := range logGroups {
+						totalBytes += lg.StoredBytes
+						if lg.RetentionDays == 0 {
+							noRetention = append(noRetention, lg)
+						}
+					}
+					sort.Slice(noRetention, func(i, j int) bool { return noRetention[i].StoredBytes > noRetention[j].StoredBytes })
+					top := noRetention
+					if len(noRetention) > 10 {
+						top = noRetention[:10]
+					}
+
+					report.LogsAudit = &entity.CloudWatchLogsAudit{
+						Profile:            g.Identifier,
+						AccountID:          accountID,
+						NoRetentionCount:   len(noRetention),
+						NoRetentionTopN:    top,
+						TotalStoredGB:      float64(totalBytes) / (1024.0 * 1024.0 * 1024.0),
+						RecommendedMessage: "Set retention days to avoid unlimited storage growth.",
+					}
+				}
+			}()
+
+			// 4. S3 Audit
+			go func() {
+				defer innerWg.Done()
+				defer bar.Increment()
+				if statuses, err := uc.awsRepo.GetS3LifecycleStatus(ctx, profile); err == nil {
+					total := len(statuses)
+					noLifecycle, versionedMissingNoncurrent, noIT, noDefaultEnc, publicRisk := 0, 0, 0, 0, 0
+					regionMap := make(map[string]int)
+					sampleNoLifecycle, sampleVersionedNoNoncurrent, sampleNoIT, sampleNoEnc, samplePublic := make([]entity.S3BucketLifecycleStatus, 0, 10), make([]entity.S3BucketLifecycleStatus, 0, 10), make([]entity.S3BucketLifecycleStatus, 0, 10), make([]entity.S3BucketLifecycleStatus, 0, 10), make([]entity.S3BucketLifecycleStatus, 0, 10)
+					sort.Slice(statuses, func(i, j int) bool { return statuses[i].Bucket < statuses[j].Bucket })
+
+					for _, s := range statuses {
+						if !s.HasLifecycle {
+							noLifecycle++
+							regionMap[s.Region]++
+							if len(sampleNoLifecycle) < 10 {
+								sampleNoLifecycle = append(sampleNoLifecycle, s)
+							}
+						}
+						if s.VersioningEnabled && !s.HasNoncurrentLifecycle {
+							versionedMissingNoncurrent++
+							if len(sampleVersionedNoNoncurrent) < 10 {
+								sampleVersionedNoNoncurrent = append(sampleVersionedNoNoncurrent, s)
+							}
+						}
+						if !s.HasIntelligentTieringCfg && !s.HasIntelligentTieringViaLifecycle {
+							noIT++
+							if len(sampleNoIT) < 10 {
+								sampleNoIT = append(sampleNoIT, s)
+							}
+						}
+						if !s.DefaultEncryptionEnabled {
+							noDefaultEnc++
+							if len(sampleNoEnc) < 10 {
+								sampleNoEnc = append(sampleNoEnc, s)
+							}
+						}
+						if s.IsPublic || !s.BlockPublicAcls || !s.BlockPublicPolicy || !s.IgnorePublicAcls || !s.RestrictPublicBuckets {
+							publicRisk++
+							if len(samplePublic) < 10 {
+								samplePublic = append(samplePublic, s)
+							}
+						}
+					}
+					report.S3Audit = &entity.S3LifecycleAudit{
+						Profile:                              g.Identifier,
+						AccountID:                            accountID,
+						TotalBuckets:                         total,
+						NoLifecycleCount:                     noLifecycle,
+						VersionedWithoutNoncurrentLifecycle:  versionedMissingNoncurrent,
+						NoIntelligentTieringCount:            noIT,
+						NoDefaultEncryptionCount:             noDefaultEnc,
+						PublicRiskCount:                      publicRisk,
+						SampleNoLifecycle:                    sampleNoLifecycle,
+						SampleVersionedWithoutNoncurrentRule: sampleVersionedNoNoncurrent,
+						SampleNoIntelligentTiering:           sampleNoIT,
+						SampleNoDefaultEncryption:            sampleNoEnc,
+						SamplePublicRisk:                     samplePublic,
+						RegionsNoLifecycle:                   regionMap,
+						RecommendedMessage:                   "Set lifecycle (incl. noncurrent rules), enable default encryption (SSE-S3/KMS), enforce Public Access Block and avoid public ACL/policies; consider Intelligent-Tiering for unpredictable access.",
+					}
+				}
+			}()
+
+			// 5. Commitments (SP)
+			go func() {
+				defer innerWg.Done()
+				defer bar.Increment()
+				if sp, err := uc.awsRepo.GetSavingsPlansSummary(ctx, profile, args.TimeRange, args.Tag); err == nil {
+					mu.Lock()
+					if report.CommitmentsAudit == nil {
+						report.CommitmentsAudit = &entity.CommitmentsReport{}
+					}
+					report.CommitmentsAudit.SPSummary = sp
+					mu.Unlock()
+				}
+			}()
+
+			// 6. Commitments (RI)
+			go func() {
+				defer innerWg.Done()
+				defer bar.Increment()
+				if ri, err := uc.awsRepo.GetReservationSummary(ctx, profile, args.TimeRange, args.Tag); err == nil {
+					mu.Lock()
+					if report.CommitmentsAudit == nil {
+						report.CommitmentsAudit = &entity.CommitmentsReport{}
+					}
+					report.CommitmentsAudit.RISummary = ri
+					mu.Unlock()
+				}
+			}()
+
+			innerWg.Wait()
+
+			// Finaliza o CommitmentsReport
+			if report.CommitmentsAudit != nil {
+				report.CommitmentsAudit.Profile = g.Identifier
+				report.CommitmentsAudit.AccountID = accountID
+				report.CommitmentsAudit.PeriodName = report.CommitmentsAudit.SPSummary.PeriodName
+			}
+
+			mu.Lock()
+			results = append(results, row{Profile: g.Identifier, Report: report})
+			mu.Unlock()
+		}(group)
+	}
+	wg.Wait()
+
+	// Ordena os resultados por perfil
+	sort.Slice(results, func(i, j int) bool { return results[i].Profile < results[j].Profile })
+
+	// Exibe um resumo no terminal
+	uc.console.Println("\n" + pterm.DefaultSection.WithLevel(1).Sprint("Full Audit Summary"))
+	for _, r := range results {
+		if r.Err != nil {
+			uc.console.Println(pterm.FgRed.Sprintf("Error auditing profile %s: %v", r.Profile, r.Err))
+			continue
+		}
+		rep := r.Report
+		uc.console.Println(pterm.FgMagenta.Sprintf("\nProfile: %s (Account: %s)", rep.Profile, rep.AccountID))
+
+		// Resumo de cada sub-relatório
+		if a := rep.MainAudit; a != nil {
+			var findings []string
+			if a.NatGatewayCosts != "None" {
+				findings = append(findings, "High-Cost NATs")
+			}
+			if a.UnusedVolumes != "None" {
+				findings = append(findings, "Unused Volumes")
+			}
+			if a.UntaggedResources != "None" {
+				findings = append(findings, "Untagged Resources")
+			}
+			uc.console.Println(fmt.Sprintf("  - Main Audit: %s", strings.Join(findings, ", ")))
+		}
+		if t := rep.TransferAudit; t != nil {
+			uc.console.Println(fmt.Sprintf("  - Data Transfer: Total $%.2f", t.Total))
+		}
+		if l := rep.LogsAudit; l != nil {
+			uc.console.Println(fmt.Sprintf("  - CloudWatch Logs: %d groups with no retention", l.NoRetentionCount))
+		}
+		if s := rep.S3Audit; s != nil {
+			uc.console.Println(fmt.Sprintf("  - S3 Buckets: %d with no lifecycle, %d with public risk", s.NoLifecycleCount, s.PublicRiskCount))
+		}
+		if c := rep.CommitmentsAudit; c != nil {
+			uc.console.Println(fmt.Sprintf("  - Commitments: SP Coverage %.2f%%, RI Coverage %.2f%%", c.SPSummary.CoveragePercent, c.RISummary.CoveragePercent))
+		}
+	}
+
+	// Exporta os relatórios
+	if args.ReportName != "" {
+		uc.console.LogInfo("Exporting full audit reports...")
+
+		fullReports := make([]entity.FullAuditReport, 0, len(results))
+		for _, r := range results {
+			if r.Err == nil {
+				fullReports = append(fullReports, r.Report)
+			}
+		}
+
+		for _, reportType := range args.ReportType {
+			switch strings.ToLower(reportType) {
+			case "csv":
+				paths, err := uc.exportRepo.ExportFullAuditReportToCSV(fullReports, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export full audit to CSV package: %v", err)
+				} else {
+					uc.console.LogSuccess("Full audit CSV package saved to: %s", strings.Join(paths, ", "))
+				}
+			case "json":
+				path, err := uc.exportRepo.ExportFullAuditReportToJSON(fullReports, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export full audit to JSON: %v", err)
+				} else {
+					uc.console.LogSuccess("Full audit JSON report saved to: %s", path)
+				}
+			case "pdf":
+				path, err := uc.exportRepo.ExportFullAuditReportToPDF(fullReports, args.ReportName, args.Dir)
+				if err != nil {
+					uc.console.LogError("Failed to export full audit to PDF: %v", err)
+				} else {
+					uc.console.LogSuccess("Full audit PDF report saved to: %s", path)
 				}
 			}
 		}

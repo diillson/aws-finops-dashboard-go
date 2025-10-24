@@ -935,3 +935,496 @@ func (r *ExportRepositoryImpl) ExportS3LifecycleAuditToPDF(audits []entity.S3Lif
 	}
 	return filepath.Abs(outputFilename)
 }
+
+// ExportCommitmentsReportToCSV exporta o relatório de SP/RI para CSV, com aviso de "Data Unavailable".
+func (r *ExportRepositoryImpl) ExportCommitmentsReportToCSV(reports []entity.CommitmentsReport, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "csv")
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Create(outputFilename)
+	if err != nil {
+		return "", fmt.Errorf("error creating commitments CSV file: %w", err)
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	defer w.Flush()
+
+	headers := []string{
+		"Profile", "Account ID", "Period",
+		"SP Coverage %", "SP Util %", "SP Unused ($)",
+		"RI Coverage %", "RI Util %", "RI Unused (hrs)",
+		"Top SP (Service | Coverage% | OnDemand$)",
+		"Top RI (Family | Coverage% | OnDemandHrs)",
+	}
+	if err := w.Write(headers); err != nil {
+		return "", fmt.Errorf("error writing CSV header: %w", err)
+	}
+
+	for _, rep := range reports {
+		period := fmt.Sprintf("%s to %s", rep.SPSummary.PeriodStart.Format("2006-01-02"), rep.SPSummary.PeriodEnd.Format("2006-01-02"))
+
+		spCoverage := fmt.Sprintf("%.2f", rep.SPSummary.CoveragePercent)
+		spUtil := fmt.Sprintf("%.2f", rep.SPSummary.UtilizationPercent)
+		spUnused := fmt.Sprintf("%.2f", rep.SPSummary.UnusedCommitment)
+		if rep.SPSummary.DataUnavailable {
+			spCoverage, spUtil, spUnused = "Data Unavailable", "Data Unavailable", "Data Unavailable"
+		}
+
+		riCoverage := fmt.Sprintf("%.2f", rep.RISummary.CoveragePercent)
+		riUtil := fmt.Sprintf("%.2f", rep.RISummary.UtilizationPercent)
+		riUnused := fmt.Sprintf("%.2f", rep.RISummary.UnusedHours)
+		if rep.RISummary.DataUnavailable {
+			riCoverage, riUtil, riUnused = "Data Unavailable", "Data Unavailable", "Data Unavailable"
+		}
+
+		topSP := func(list []entity.ServiceCoverage, n int) string {
+			if len(list) == 0 {
+				return "N/A"
+			}
+			limit := len(list)
+			if limit > n {
+				limit = n
+			}
+			var lines []string
+			for i := 0; i < limit; i++ {
+				l := list[i]
+				lines = append(lines, fmt.Sprintf("%s | %.2f%% | $%.2f", l.Service, l.CoveragePercent, l.OnDemandCost))
+			}
+			if len(list) > limit {
+				lines = append(lines, fmt.Sprintf("... (+%d more)", len(list)-limit))
+			}
+			return cleanRichTags(strings.Join(lines, "\n"))
+		}
+
+		topRI := func(list []entity.ServiceCoverage, n int) string {
+			if len(list) == 0 {
+				return "N/A"
+			}
+			limit := len(list)
+			if limit > n {
+				limit = n
+			}
+			var lines []string
+			for i := 0; i < limit; i++ {
+				l := list[i]
+				// OnDemandCost armazena horas no caso de RI
+				lines = append(lines, fmt.Sprintf("%s | %.2f%% | %.2f hrs", l.Service, l.CoveragePercent, l.OnDemandCost))
+			}
+			if len(list) > limit {
+				lines = append(lines, fmt.Sprintf("... (+%d more)", len(list)-limit))
+			}
+			return cleanRichTags(strings.Join(lines, "\n"))
+		}
+
+		record := []string{
+			rep.Profile,
+			rep.AccountID,
+			period,
+			spCoverage,
+			spUtil,
+			spUnused,
+			riCoverage,
+			riUtil,
+			riUnused,
+			topSP(rep.SPSummary.PerServiceCoverage, 5),
+			topRI(rep.RISummary.PerServiceCoverage, 5),
+		}
+		if err := w.Write(record); err != nil {
+			return "", fmt.Errorf("error writing CSV record: %w", err)
+		}
+	}
+	return filepath.Abs(outputFilename)
+}
+
+func (r *ExportRepositoryImpl) ExportCommitmentsReportToJSON(reports []entity.CommitmentsReport, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "json")
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Create(outputFilename)
+	if err != nil {
+		return "", fmt.Errorf("error creating commitments JSON file: %w", err)
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(reports); err != nil {
+		return "", fmt.Errorf("error encoding commitments JSON: %w", err)
+	}
+	return filepath.Abs(outputFilename)
+}
+
+// ExportCommitmentsReportToPDF exporta o relatório de SP/RI para PDF, com aviso de "Data Unavailable".
+func (r *ExportRepositoryImpl) ExportCommitmentsReportToPDF(reports []entity.CommitmentsReport, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "pdf")
+	if err != nil {
+		return "", err
+	}
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	tr := pdf.UnicodeTranslatorFromDescriptor("")
+
+	for i, rep := range reports {
+		pdf.AddPage()
+		headerColor := [3]int{34, 139, 34}
+		headerTextColor := [3]int{255, 255, 255}
+		sectionTitleColor := [3]int{0, 0, 0}
+		bodyTextColor := [3]int{50, 50, 50}
+		lineColor := [3]int{200, 200, 200}
+
+		drawSection := func(title string, content string) {
+			content = cleanRichTags(content)
+			if strings.TrimSpace(content) == "" {
+				return
+			}
+			pdf.SetFont("Arial", "B", 12)
+			pdf.SetTextColor(sectionTitleColor[0], sectionTitleColor[1], sectionTitleColor[2])
+			pdf.Cell(0, 8, tr(title))
+			pdf.Ln(7)
+			pdf.SetDrawColor(lineColor[0], lineColor[1], lineColor[2])
+			pdf.Line(pdf.GetX(), pdf.GetY(), pdf.GetX()+190, pdf.GetY())
+			pdf.Ln(4)
+			pdf.SetFont("Arial", "", 10)
+			pdf.SetTextColor(bodyTextColor[0], bodyTextColor[1], bodyTextColor[2])
+			pdf.MultiCell(190, 5, tr(content), "", "L", false)
+			pdf.Ln(8)
+		}
+
+		// Header
+		pdf.SetFillColor(headerColor[0], headerColor[1], headerColor[2])
+		pdf.SetTextColor(headerTextColor[0], headerTextColor[1], headerTextColor[2])
+		pdf.SetFont("Arial", "B", 14)
+		pdf.CellFormat(0, 12, tr("  Savings Plans / RI Commitments"), "", 1, "L", true, 0, "")
+		pdf.SetFont("Arial", "", 10)
+		pdf.SetFillColor(240, 240, 240)
+		pdf.SetTextColor(bodyTextColor[0], bodyTextColor[1], bodyTextColor[2])
+		period := fmt.Sprintf("%s to %s", rep.SPSummary.PeriodStart.Format("2006-01-02"), rep.SPSummary.PeriodEnd.Format("2006-01-02"))
+		pdf.CellFormat(0, 8, tr(fmt.Sprintf("  Profile: %s  |  Account ID: %s  |  Period: %s", rep.Profile, rep.AccountID, period)), "", 1, "L", true, 0, "")
+		pdf.Ln(6)
+
+		// SP Summary
+		var spSummary string
+		if rep.SPSummary.DataUnavailable {
+			spSummary = "Data Unavailable"
+		} else {
+			spSummary = fmt.Sprintf("Coverage: %.2f%%\nUtilization: %.2f%%\nUnused Commitment: $%.2f",
+				rep.SPSummary.CoveragePercent, rep.SPSummary.UtilizationPercent, rep.SPSummary.UnusedCommitment,
+			)
+		}
+		drawSection("Savings Plans — Summary", spSummary)
+
+		// SP Top Services
+		if !rep.SPSummary.DataUnavailable && len(rep.SPSummary.PerServiceCoverage) > 0 {
+			var b strings.Builder
+			limit := len(rep.SPSummary.PerServiceCoverage)
+			if limit > 12 {
+				limit = 12
+			}
+			for j := 0; j < limit; j++ {
+				l := rep.SPSummary.PerServiceCoverage[j]
+				b.WriteString(fmt.Sprintf("%s: coverage %.2f%%, OnDemand $%.2f\n", l.Service, l.CoveragePercent, l.OnDemandCost))
+			}
+			if len(rep.SPSummary.PerServiceCoverage) > limit {
+				b.WriteString(fmt.Sprintf("... (+%d more)\n", len(rep.SPSummary.PerServiceCoverage)-limit))
+			}
+			drawSection("Savings Plans — Top Services (by On-Demand $)", b.String())
+		}
+
+		// RI Summary
+		var riSummary string
+		if rep.RISummary.DataUnavailable {
+			riSummary = "Data Unavailable"
+		} else {
+			riSummary = fmt.Sprintf("Coverage: %.2f%%\nUtilization: %.2f%%\nUnused Hours: %.2f\nUsed Hours: %.2f",
+				rep.RISummary.CoveragePercent, rep.RISummary.UtilizationPercent, rep.RISummary.UnusedHours, rep.RISummary.UsedHours,
+			)
+		}
+		drawSection("Reserved Instances — Summary", riSummary)
+
+		// RI Top Services (ordenados por On-Demand Hours)
+		if !rep.RISummary.DataUnavailable && len(rep.RISummary.PerServiceCoverage) > 0 {
+			var b strings.Builder
+			limit := len(rep.RISummary.PerServiceCoverage)
+			if limit > 12 {
+				limit = 12
+			}
+			for j := 0; j < limit; j++ {
+				l := rep.RISummary.PerServiceCoverage[j]
+				b.WriteString(fmt.Sprintf("%s: coverage %.2f%%, OnDemand Hrs %.2f\n", l.Service, l.CoveragePercent, l.OnDemandCost))
+			}
+			if len(rep.RISummary.PerServiceCoverage) > limit {
+				b.WriteString(fmt.Sprintf("... (+%d more)\n", len(rep.RISummary.PerServiceCoverage)-limit))
+			}
+			drawSection("Reserved Instances — Top Families (by On-Demand Hours)", b.String())
+		}
+
+		// Footer
+		pdf.SetY(-15)
+		pdf.SetFont("Arial", "I", 8)
+		pdf.SetTextColor(128, 128, 128)
+		pdf.CellFormat(0, 10, tr(fmt.Sprintf("Commitments Report | %s", time.Now().Format("2006-01-02"))), "", 0, "L", false, 0, "")
+		pdf.CellFormat(0, 10, tr(fmt.Sprintf("Page %d", i+1)), "", 0, "R", false, 0, "")
+	}
+
+	if err := pdf.OutputFileAndClose(outputFilename); err != nil {
+		return "", fmt.Errorf("error writing commitments PDF: %w", err)
+	}
+	return filepath.Abs(outputFilename)
+}
+
+// ExportFullAuditReportToCSV gera um pacote de arquivos CSV, um para cada sub-relatório.
+func (r *ExportRepositoryImpl) ExportFullAuditReportToCSV(reports []entity.FullAuditReport, baseFilename, outputDir string) ([]string, error) {
+	var generatedFiles []string
+
+	// Extrai os sub-relatórios
+	mainAudits := make([]entity.AuditData, 0, len(reports))
+	transferAudits := make([]entity.DataTransferReport, 0, len(reports))
+	logsAudits := make([]entity.CloudWatchLogsAudit, 0, len(reports))
+	s3Audits := make([]entity.S3LifecycleAudit, 0, len(reports))
+	commitmentsAudits := make([]entity.CommitmentsReport, 0, len(reports))
+
+	for _, rep := range reports {
+		if rep.MainAudit != nil {
+			mainAudits = append(mainAudits, *rep.MainAudit)
+		}
+		if rep.TransferAudit != nil {
+			transferAudits = append(transferAudits, *rep.TransferAudit)
+		}
+		if rep.LogsAudit != nil {
+			logsAudits = append(logsAudits, *rep.LogsAudit)
+		}
+		if rep.S3Audit != nil {
+			s3Audits = append(s3Audits, *rep.S3Audit)
+		}
+		if rep.CommitmentsAudit != nil {
+			commitmentsAudits = append(commitmentsAudits, *rep.CommitmentsAudit)
+		}
+	}
+
+	// Chama os exportadores individuais com nomes de arquivo derivados
+	if len(mainAudits) > 0 {
+		if path, err := r.ExportAuditReportToCSV(mainAudits, baseFilename+"_main", outputDir); err == nil {
+			generatedFiles = append(generatedFiles, path)
+		}
+	}
+	if len(transferAudits) > 0 {
+		if path, err := r.ExportTransferReportToCSV(transferAudits, baseFilename+"_transfer", outputDir); err == nil {
+			generatedFiles = append(generatedFiles, path)
+		}
+	}
+	if len(logsAudits) > 0 {
+		if path, err := r.ExportLogsAuditToCSV(logsAudits, baseFilename+"_logs", outputDir); err == nil {
+			generatedFiles = append(generatedFiles, path)
+		}
+	}
+	if len(s3Audits) > 0 {
+		if path, err := r.ExportS3LifecycleAuditToCSV(s3Audits, baseFilename+"_s3", outputDir); err == nil {
+			generatedFiles = append(generatedFiles, path)
+		}
+	}
+	if len(commitmentsAudits) > 0 {
+		if path, err := r.ExportCommitmentsReportToCSV(commitmentsAudits, baseFilename+"_commitments", outputDir); err == nil {
+			generatedFiles = append(generatedFiles, path)
+		}
+	}
+
+	return generatedFiles, nil
+}
+
+// ExportFullAuditReportToJSON gera um único JSON com todos os dados.
+func (r *ExportRepositoryImpl) ExportFullAuditReportToJSON(reports []entity.FullAuditReport, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "json")
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Create(outputFilename)
+	if err != nil {
+		return "", fmt.Errorf("error creating full audit JSON file: %w", err)
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(reports); err != nil {
+		return "", fmt.Errorf("error encoding full audit JSON: %w", err)
+	}
+	return filepath.Abs(outputFilename)
+}
+
+// ExportFullAuditReportToPDF gera um único PDF com "capítulos" para cada auditoria.
+func (r *ExportRepositoryImpl) ExportFullAuditReportToPDF(reports []entity.FullAuditReport, filename, outputDir string) (string, error) {
+	outputFilename, err := generateFilename(filename, outputDir, "pdf")
+	if err != nil {
+		return "", err
+	}
+
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	tr := pdf.UnicodeTranslatorFromDescriptor("")
+
+	for _, rep := range reports {
+		// --- Página de Rosto do Relatório para o Perfil ---
+		pdf.AddPage()
+		pdf.SetFont("Arial", "B", 24)
+		pdf.SetTextColor(0, 0, 0)
+		pdf.Cell(0, 20, "Full FinOps Audit Report")
+		pdf.Ln(15)
+		pdf.SetFont("Arial", "", 14)
+		pdf.Cell(0, 10, fmt.Sprintf("Profile: %s", rep.Profile))
+		pdf.Ln(8)
+		pdf.Cell(0, 10, fmt.Sprintf("Account ID: %s", rep.AccountID))
+		pdf.Ln(8)
+		pdf.Cell(0, 10, fmt.Sprintf("Generated on: %s", time.Now().Format("2006-01-02 15:04:05")))
+		pdf.Ln(20)
+
+		// Índice
+		pdf.SetFont("Arial", "B", 16)
+		pdf.Cell(0, 10, "Table of Contents")
+		pdf.Ln(10)
+		pdf.SetFont("Arial", "", 12)
+		if rep.MainAudit != nil {
+			pdf.Cell(0, 8, "1. Main Audit (Unused, Untagged, etc.)")
+			pdf.Ln(6)
+		}
+		if rep.TransferAudit != nil {
+			pdf.Cell(0, 8, "2. Data Transfer Deep Dive")
+			pdf.Ln(6)
+		}
+		if rep.LogsAudit != nil {
+			pdf.Cell(0, 8, "3. CloudWatch Logs Retention")
+			pdf.Ln(6)
+		}
+		if rep.S3Audit != nil {
+			pdf.Cell(0, 8, "4. S3 Lifecycle & Security")
+			pdf.Ln(6)
+		}
+		if rep.CommitmentsAudit != nil {
+			pdf.Cell(0, 8, "5. Commitments (SP/RI)")
+			pdf.Ln(6)
+		}
+
+		// --- Seções/Capítulos ---
+		drawChapter := func(title string, drawContent func()) {
+			pdf.AddPage()
+			pdf.SetFont("Arial", "B", 18)
+			pdf.SetFillColor(230, 230, 230)
+			pdf.CellFormat(0, 12, fmt.Sprintf("  %s", title), "", 1, "L", true, 0, "")
+			pdf.Ln(8)
+			drawContent()
+		}
+
+		drawSection := func(title string, content string) {
+			content = cleanRichTags(content)
+			if strings.TrimSpace(content) == "" || content == "None" {
+				return
+			}
+			pdf.SetFont("Arial", "B", 12)
+			pdf.Cell(0, 8, tr(title))
+			pdf.Ln(7)
+			pdf.SetDrawColor(200, 200, 200)
+			pdf.Line(pdf.GetX(), pdf.GetY(), pdf.GetX()+190, pdf.GetY())
+			pdf.Ln(4)
+			pdf.SetFont("Arial", "", 10)
+			pdf.MultiCell(190, 5, tr(content), "", "L", false)
+			pdf.Ln(8)
+		}
+
+		// 1. Main Audit
+		if a := rep.MainAudit; a != nil {
+			drawChapter("1. Main Audit", func() {
+				drawSection("Budget Alerts", a.BudgetAlerts)
+				drawSection("High-Cost NAT Gateways", a.NatGatewayCosts)
+				drawSection("Unused VPC Endpoints", a.UnusedVpcEndpoints)
+				drawSection("Idle Load Balancers", a.IdleLoadBalancers)
+				drawSection("Stopped EC2 Instances", a.StoppedInstances)
+				drawSection("Unused EBS Volumes", a.UnusedVolumes)
+				drawSection("Unused Elastic IPs", a.UnusedEIPs)
+				drawSection("Untagged Resources", a.UntaggedResources)
+			})
+		}
+
+		// 2. Data Transfer
+		if t := rep.TransferAudit; t != nil {
+			drawChapter("2. Data Transfer Deep Dive", func() {
+				var b strings.Builder
+				b.WriteString(fmt.Sprintf("Total: $%.2f\n\n", t.Total))
+				for _, c := range t.Categories {
+					b.WriteString(fmt.Sprintf("%s: $%.2f\n", c.Category, c.Cost))
+				}
+				drawSection("Category Summary", b.String())
+
+				if len(t.TopLines) > 0 {
+					var tl strings.Builder
+					for _, l := range t.TopLines {
+						tl.WriteString(fmt.Sprintf("%s | %s: $%.2f\n", l.Service, l.UsageType, l.Cost))
+					}
+					drawSection("Top Lines", tl.String())
+				}
+			})
+		}
+
+		// 3. Logs Audit
+		if l := rep.LogsAudit; l != nil {
+			drawChapter("3. CloudWatch Logs Retention", func() {
+				summary := fmt.Sprintf("No Retention (count): %d\nTotal Stored (GB): %.2f\n\nRecommendation: %s", l.NoRetentionCount, l.TotalStoredGB, l.RecommendedMessage)
+				drawSection("Summary", summary)
+				if len(l.NoRetentionTopN) > 0 {
+					var b strings.Builder
+					for _, lg := range l.NoRetentionTopN {
+						b.WriteString(fmt.Sprintf("%s | %s | %.2f GB\n", lg.Region, lg.GroupName, float64(lg.StoredBytes)/(1024*1024*1024)))
+					}
+					drawSection("Top No-Retention Log Groups", b.String())
+				}
+			})
+		}
+
+		// 4. S3 Audit
+		if s := rep.S3Audit; s != nil {
+			drawChapter("4. S3 Lifecycle & Security", func() {
+				summary := fmt.Sprintf("Total Buckets: %d\nNo Lifecycle: %d\nVersioned w/o Noncurrent Rule: %d\nNo Intelligent-Tiering: %d\nNo Default Encryption: %d\nPublic Risk: %d\n\nRecommendation: %s", s.TotalBuckets, s.NoLifecycleCount, s.VersionedWithoutNoncurrentLifecycle, s.NoIntelligentTieringCount, s.NoDefaultEncryptionCount, s.PublicRiskCount, s.RecommendedMessage)
+				drawSection("Summary", summary)
+				// Adicionar amostras se necessário
+			})
+		}
+
+		// 5. Commitments
+		if c := rep.CommitmentsAudit; c != nil {
+			drawChapter("5. Commitments (SP/RI)", func() {
+				// SP
+				var spSummary string
+				if c.SPSummary.DataUnavailable {
+					spSummary = "Data Unavailable"
+				} else {
+					spSummary = fmt.Sprintf("Coverage: %.2f%%\nUtilization: %.2f%%\nUnused Commitment: $%.2f", c.SPSummary.CoveragePercent, c.SPSummary.UtilizationPercent, c.SPSummary.UnusedCommitment)
+				}
+				drawSection("Savings Plans — Summary", spSummary)
+				if !c.SPSummary.DataUnavailable && len(c.SPSummary.PerServiceCoverage) > 0 {
+					var b strings.Builder
+					for _, l := range c.SPSummary.PerServiceCoverage {
+						b.WriteString(fmt.Sprintf("%s: coverage %.2f%%, OnDemand $%.2f\n", l.Service, l.CoveragePercent, l.OnDemandCost))
+					}
+					drawSection("Savings Plans — Top Services (by On-Demand $)", b.String())
+				}
+
+				// RI
+				var riSummary string
+				if c.RISummary.DataUnavailable {
+					riSummary = "Data Unavailable"
+				} else {
+					riSummary = fmt.Sprintf("Coverage: %.2f%%\nUtilization: %.2f%%\nUnused Hours: %.2f", c.RISummary.CoveragePercent, c.RISummary.UtilizationPercent, c.RISummary.UnusedHours)
+				}
+				drawSection("Reserved Instances — Summary", riSummary)
+				if !c.RISummary.DataUnavailable && len(c.RISummary.PerServiceCoverage) > 0 {
+					var b strings.Builder
+					for _, l := range c.RISummary.PerServiceCoverage {
+						b.WriteString(fmt.Sprintf("%s: coverage %.2f%%, OnDemand Hrs %.2f\n", l.Service, l.CoveragePercent, l.OnDemandCost))
+					}
+					drawSection("Reserved Instances — Top Families (by On-Demand Hours)", b.String())
+				}
+			})
+		}
+	}
+
+	if err := pdf.OutputFileAndClose(outputFilename); err != nil {
+		return "", fmt.Errorf("error writing full audit PDF file: %w", err)
+	}
+	return filepath.Abs(outputFilename)
+}

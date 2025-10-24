@@ -18,4 +18,6 @@ type CLIArgs struct {
 	Transfer       bool
 	LogsAudit      bool
 	S3Audit        bool
+	Commitments    bool
+	FullAudit      bool
 }

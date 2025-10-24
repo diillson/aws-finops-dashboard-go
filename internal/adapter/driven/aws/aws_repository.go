@@ -1426,3 +1426,356 @@ func (r *AWSRepositoryImpl) inspectBucketLifecycle(ctx context.Context, profile 
 
 	return status
 }
+
+// GetSavingsPlansSummary consulta cobertura (por serviço) e utilização (total) de Savings Plans.
+// Em caso de DataUnavailableException, retorna dados zerados e a flag DataUnavailable = true.
+func (r *AWSRepositoryImpl) GetSavingsPlansSummary(ctx context.Context, profile string, timeRange *int, tags []string) (entity.SPSummary, error) {
+	client, err := r.getServiceClient(ctx, profile, "", "costexplorer")
+	if err != nil {
+		return entity.SPSummary{}, err
+	}
+	ceClient := client.(*costexplorer.Client)
+
+	// Período
+	today := time.Now().UTC()
+	var startDate, endDate time.Time
+	periodName := "Current month's SP"
+	if timeRange != nil && *timeRange > 0 {
+		endDate = today
+		startDate = today.AddDate(0, 0, -(*timeRange))
+		periodName = fmt.Sprintf("Current %d days SP", *timeRange)
+	} else {
+		startDate = time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, time.UTC)
+		endDate = today
+		if startDate.Day() == endDate.Day() && startDate.Month() == endDate.Month() && startDate.Year() == endDate.Year() {
+			endDate = endDate.AddDate(0, 0, 1)
+		}
+	}
+
+	// Relatório base com DataUnavailable
+	accountID, _ := r.GetAccountID(ctx, profile)
+	baseSummary := entity.SPSummary{
+		AccountID:       accountID,
+		PeriodStart:     startDate,
+		PeriodEnd:       endDate,
+		PeriodName:      periodName,
+		DataUnavailable: false,
+	}
+
+	filter, _ := parseTagFilter(tags)
+
+	// 1) Cobertura por serviço
+	coverageInput := &costexplorer.GetSavingsPlansCoverageInput{
+		TimePeriod: &ceTypes.DateInterval{
+			Start: aws.String(startDate.Format("2006-01-02")),
+			End:   aws.String(endDate.Format("2006-01-02")),
+		},
+		Granularity: ceTypes.GranularityMonthly,
+		GroupBy: []ceTypes.GroupDefinition{
+			{Type: ceTypes.GroupDefinitionTypeDimension, Key: aws.String("SERVICE")},
+		},
+	}
+	if filter != nil {
+		coverageInput.Filter = filter
+	}
+
+	coverageOut, err := ceClient.GetSavingsPlansCoverage(ctx, coverageInput)
+	if err != nil && filter != nil {
+		coverageInput.Filter = nil
+		coverageOut, err = ceClient.GetSavingsPlansCoverage(ctx, coverageInput)
+	}
+	if err != nil {
+		if r.isCEDataUnavailable(err) {
+			baseSummary.DataUnavailable = true
+			return baseSummary, nil // Retorna zerado com aviso
+		}
+		return entity.SPSummary{}, fmt.Errorf("GetSavingsPlansCoverage failed: %w", err)
+	}
+
+	var perService []entity.ServiceCoverage
+	var totalCoveredCost, totalOnDemandCost float64
+
+	if len(coverageOut.SavingsPlansCoverages) > 0 {
+		for _, item := range coverageOut.SavingsPlansCoverages {
+			svc := ""
+			if item.Attributes != nil {
+				if v, ok := item.Attributes["SERVICE"]; ok {
+					svc = v
+				}
+			}
+			var covered, ondemand, pct float64
+			if item.Coverage != nil {
+				if item.Coverage.SpendCoveredBySavingsPlans != nil {
+					covered, _ = strconv.ParseFloat(*item.Coverage.SpendCoveredBySavingsPlans, 64)
+				}
+				if item.Coverage.OnDemandCost != nil {
+					ondemand, _ = strconv.ParseFloat(*item.Coverage.OnDemandCost, 64)
+				}
+				if item.Coverage.CoveragePercentage != nil {
+					pct, _ = strconv.ParseFloat(*item.Coverage.CoveragePercentage, 64)
+				} else if (covered + ondemand) > 0.001 {
+					pct = (covered / (covered + ondemand)) * 100.0
+				}
+			}
+			if covered+ondemand > 0.001 {
+				perService = append(perService, entity.ServiceCoverage{
+					Service:         svc,
+					CoveragePercent: pct,
+					CoveredCost:     covered,
+					OnDemandCost:    ondemand,
+				})
+				totalCoveredCost += covered
+				totalOnDemandCost += ondemand
+			}
+		}
+	}
+
+	sort.Slice(perService, func(i, j int) bool { return perService[i].OnDemandCost > perService[j].OnDemandCost })
+
+	overallCoveragePercent := 0.0
+	if (totalCoveredCost + totalOnDemandCost) > 0.001 {
+		overallCoveragePercent = (totalCoveredCost / (totalCoveredCost + totalOnDemandCost)) * 100.0
+	}
+	baseSummary.CoveragePercent = overallCoveragePercent
+	baseSummary.PerServiceCoverage = perService
+
+	// 2) Utilização (agregado)
+	utilInput := &costexplorer.GetSavingsPlansUtilizationInput{
+		TimePeriod: &ceTypes.DateInterval{
+			Start: aws.String(startDate.Format("2006-01-02")),
+			End:   aws.String(endDate.Format("2006-01-02")),
+		},
+		Granularity: ceTypes.GranularityMonthly,
+	}
+	if filter != nil {
+		utilInput.Filter = filter
+	}
+
+	utilOut, err := ceClient.GetSavingsPlansUtilization(ctx, utilInput)
+	if err != nil && filter != nil {
+		utilInput.Filter = nil
+		utilOut, err = ceClient.GetSavingsPlansUtilization(ctx, utilInput)
+	}
+	if err != nil {
+		if r.isCEDataUnavailable(err) {
+			baseSummary.DataUnavailable = true
+			return baseSummary, nil
+		}
+		return entity.SPSummary{}, fmt.Errorf("GetSavingsPlansUtilization failed: %w", err)
+	}
+
+	var sumTotalCommit, sumUsedCommit, sumUnusedCommit float64
+	if len(utilOut.SavingsPlansUtilizationsByTime) > 0 {
+		for _, by := range utilOut.SavingsPlansUtilizationsByTime {
+			agg := by.Utilization
+			if agg == nil {
+				continue
+			}
+			if agg.TotalCommitment != nil {
+				v, _ := strconv.ParseFloat(*agg.TotalCommitment, 64)
+				sumTotalCommit += v
+			}
+			if agg.UsedCommitment != nil {
+				v, _ := strconv.ParseFloat(*agg.UsedCommitment, 64)
+				sumUsedCommit += v
+			}
+			if agg.UnusedCommitment != nil {
+				v, _ := strconv.ParseFloat(*agg.UnusedCommitment, 64)
+				sumUnusedCommit += v
+			}
+		}
+	}
+
+	utilPct := 0.0
+	if sumTotalCommit > 0.001 {
+		utilPct = (sumUsedCommit / sumTotalCommit) * 100.0
+	}
+
+	baseSummary.UtilizationPercent = utilPct
+	baseSummary.TotalCommitment = sumTotalCommit
+	baseSummary.UsedCommitment = sumUsedCommit
+	baseSummary.UnusedCommitment = sumUnusedCommit
+
+	return baseSummary, nil
+}
+
+// GetReservationSummary consulta cobertura (por família de instância) e utilização (total) de Reserved Instances.
+// Em caso de ValidationException ou DataUnavailableException, retorna dados zerados e a flag DataUnavailable = true.
+func (r *AWSRepositoryImpl) GetReservationSummary(ctx context.Context, profile string, timeRange *int, tags []string) (entity.RISummary, error) {
+	client, err := r.getServiceClient(ctx, profile, "", "costexplorer")
+	if err != nil {
+		return entity.RISummary{}, err
+	}
+	ceClient := client.(*costexplorer.Client)
+
+	// Período
+	today := time.Now().UTC()
+	var startDate, endDate time.Time
+	periodName := "Current month's RI"
+	if timeRange != nil && *timeRange > 0 {
+		endDate = today
+		startDate = today.AddDate(0, 0, -(*timeRange))
+		periodName = fmt.Sprintf("Current %d days RI", *timeRange)
+	} else {
+		startDate = time.Date(today.Year(), today.Month(), 1, 0, 0, 0, 0, time.UTC)
+		endDate = today
+		if startDate.Day() == endDate.Day() && startDate.Month() == endDate.Month() && startDate.Year() == endDate.Year() {
+			endDate = endDate.AddDate(0, 0, 1)
+		}
+	}
+
+	accountID, _ := r.GetAccountID(ctx, profile)
+	baseSummary := entity.RISummary{
+		AccountID:       accountID,
+		PeriodStart:     startDate,
+		PeriodEnd:       endDate,
+		PeriodName:      periodName,
+		DataUnavailable: false,
+	}
+
+	filter, _ := parseTagFilter(tags)
+
+	// 1) Cobertura — tentar por INSTANCE_TYPE_FAMILY (suportado)
+	riCovInput := &costexplorer.GetReservationCoverageInput{
+		TimePeriod: &ceTypes.DateInterval{
+			Start: aws.String(startDate.Format("2006-01-02")),
+			End:   aws.String(endDate.Format("2006-01-02")),
+		},
+		Granularity: ceTypes.GranularityMonthly,
+		GroupBy: []ceTypes.GroupDefinition{
+			{Type: ceTypes.GroupDefinitionTypeDimension, Key: aws.String("INSTANCE_TYPE_FAMILY")},
+		},
+	}
+	if filter != nil {
+		riCovInput.Filter = filter
+	}
+
+	riCovOut, err := ceClient.GetReservationCoverage(ctx, riCovInput)
+	if err != nil {
+		if filter != nil {
+			riCovInput.Filter = nil
+			riCovOut, err = ceClient.GetReservationCoverage(ctx, riCovInput)
+		}
+		if err != nil && (r.isCEValidationException(err) || r.isCEDataUnavailable(err)) {
+			riCovInput.GroupBy = nil
+			riCovOut, err = ceClient.GetReservationCoverage(ctx, riCovInput)
+		}
+	}
+	if err != nil {
+		if r.isCEDataUnavailable(err) || r.isCEValidationException(err) {
+			baseSummary.DataUnavailable = true
+			return baseSummary, nil
+		}
+		return entity.RISummary{}, fmt.Errorf("GetReservationCoverage failed: %w", err)
+	}
+
+	var perFamily []entity.ServiceCoverage
+	overallCoveragePercent := 0.0
+
+	if riCovOut != nil && len(riCovOut.CoveragesByTime) > 0 {
+		for _, byTime := range riCovOut.CoveragesByTime {
+			if len(byTime.Groups) > 0 {
+				for _, grp := range byTime.Groups {
+					label := ""
+					if grp.Attributes != nil {
+						if v, ok := grp.Attributes["INSTANCE_TYPE_FAMILY"]; ok {
+							label = v
+						}
+					}
+					var pct, onDemandHrs float64
+					if grp.Coverage != nil && grp.Coverage.CoverageHours != nil {
+						if grp.Coverage.CoverageHours.CoverageHoursPercentage != nil {
+							pct, _ = strconv.ParseFloat(*grp.Coverage.CoverageHours.CoverageHoursPercentage, 64)
+						}
+						if grp.Coverage.CoverageHours.OnDemandHours != nil {
+							onDemandHrs, _ = strconv.ParseFloat(*grp.Coverage.CoverageHours.OnDemandHours, 64)
+						}
+					}
+					perFamily = append(perFamily, entity.ServiceCoverage{
+						Service:         label,
+						CoveragePercent: pct,
+						OnDemandCost:    onDemandHrs,
+					})
+				}
+			}
+			if byTime.Total != nil && byTime.Total.CoverageHours != nil && byTime.Total.CoverageHours.CoverageHoursPercentage != nil {
+				if v, e := strconv.ParseFloat(*byTime.Total.CoverageHours.CoverageHoursPercentage, 64); e == nil {
+					overallCoveragePercent = v
+				}
+			}
+		}
+		sort.Slice(perFamily, func(i, j int) bool { return perFamily[i].OnDemandCost > perFamily[j].OnDemandCost })
+	}
+	baseSummary.CoveragePercent = overallCoveragePercent
+	baseSummary.PerServiceCoverage = perFamily
+
+	// 2) Utilização
+	riUtilInput := &costexplorer.GetReservationUtilizationInput{
+		TimePeriod: &ceTypes.DateInterval{
+			Start: aws.String(startDate.Format("2006-01-02")),
+			End:   aws.String(endDate.Format("2006-01-02")),
+		},
+		Granularity: ceTypes.GranularityMonthly,
+	}
+	if filter != nil {
+		riUtilInput.Filter = filter
+	}
+	riUtilOut, err := ceClient.GetReservationUtilization(ctx, riUtilInput)
+	if err != nil && filter != nil {
+		riUtilInput.Filter = nil
+		riUtilOut, err = ceClient.GetReservationUtilization(ctx, riUtilInput)
+	}
+	var utilPct, usedHours, unusedHours, totalHours float64
+	if err != nil {
+		if r.isCEDataUnavailable(err) {
+			baseSummary.DataUnavailable = true
+			return baseSummary, nil
+		}
+		return entity.RISummary{}, fmt.Errorf("GetReservationUtilization failed: %w", err)
+	} else if riUtilOut != nil && riUtilOut.Total != nil {
+		if riUtilOut.Total.UtilizationPercentage != nil {
+			utilPct, _ = strconv.ParseFloat(*riUtilOut.Total.UtilizationPercentage, 64)
+		}
+		if riUtilOut.Total.TotalActualHours != nil {
+			usedHours, _ = strconv.ParseFloat(*riUtilOut.Total.TotalActualHours, 64)
+		}
+		if riUtilOut.Total.UnusedHours != nil {
+			unusedHours, _ = strconv.ParseFloat(*riUtilOut.Total.UnusedHours, 64)
+		}
+		if riUtilOut.Total.PurchasedHours != nil {
+			totalHours, _ = strconv.ParseFloat(*riUtilOut.Total.PurchasedHours, 64)
+		}
+	}
+	if totalHours < 0.001 && (usedHours+unusedHours) > 0.001 {
+		totalHours = usedHours + unusedHours
+	}
+	if utilPct < 0.001 && totalHours > 0.001 {
+		utilPct = (usedHours / totalHours) * 100.0
+	}
+
+	baseSummary.UtilizationPercent = utilPct
+	baseSummary.UsedHours = usedHours
+	baseSummary.UnusedHours = unusedHours
+	baseSummary.TotalReservedHours = totalHours
+
+	return baseSummary, nil
+}
+
+// isCEDataUnavailable identifica o erro "DataUnavailableException" do Cost Explorer.
+func (r *AWSRepositoryImpl) isCEDataUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Checagem defensiva por substring é a mais estável no SDK v2 independente do tipo concreto.
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "dataunavailableexception") || strings.Contains(msg, "data unavailable")
+}
+
+// isCEValidationException identifica "ValidationException" do Cost Explorer.
+func (r *AWSRepositoryImpl) isCEValidationException(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "validationexception")
+}

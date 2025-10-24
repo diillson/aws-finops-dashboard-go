@@ -6,7 +6,6 @@ import (
 	"github.com/diillson/aws-finops-dashboard-go/internal/domain/entity"
 )
 
-// AWSRepository defines the interface for AWS API interactions.
 type AWSRepository interface {
 	// Profile Operations
 	GetAWSProfiles() []string
@@ -34,12 +33,16 @@ type AWSRepository interface {
 	GetNatGatewayCost(ctx context.Context, profile string, timeRange *int, tags []string) ([]entity.NatGatewayCost, error)
 	GetUnusedVpcEndpoints(ctx context.Context, profile string, regions []string) (entity.UnusedVpcEndpoints, error)
 
-	// Data Transfer Deep Dive
+	// Data Transfer
 	GetDataTransferBreakdown(ctx context.Context, profile string, timeRange *int, tags []string) (entity.DataTransferReport, error)
 
-	// CloudWatch Logs Retention Audit
+	// CloudWatch Logs
 	GetCloudWatchLogGroups(ctx context.Context, profile string, regions []string) ([]entity.CloudWatchLogGroupInfo, error)
 
-	// S3 Lifecycle Audit
+	// S3 Lifecycle
 	GetS3LifecycleStatus(ctx context.Context, profile string) ([]entity.S3BucketLifecycleStatus, error)
+
+	// Savings Plans / Reserved Instances (Coverage & Utilization)
+	GetSavingsPlansSummary(ctx context.Context, profile string, timeRange *int, tags []string) (entity.SPSummary, error)
+	GetReservationSummary(ctx context.Context, profile string, timeRange *int, tags []string) (entity.RISummary, error)
 }

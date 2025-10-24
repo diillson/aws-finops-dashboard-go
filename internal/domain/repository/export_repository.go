@@ -27,4 +27,14 @@ type ExportRepository interface {
 	ExportS3LifecycleAuditToCSV(audits []entity.S3LifecycleAudit, filename, outputDir string) (string, error)
 	ExportS3LifecycleAuditToJSON(audits []entity.S3LifecycleAudit, filename, outputDir string) (string, error)
 	ExportS3LifecycleAuditToPDF(audits []entity.S3LifecycleAudit, filename, outputDir string) (string, error)
+
+	// Commitments (SP/RI)
+	ExportCommitmentsReportToCSV(reports []entity.CommitmentsReport, filename, outputDir string) (string, error)
+	ExportCommitmentsReportToJSON(reports []entity.CommitmentsReport, filename, outputDir string) (string, error)
+	ExportCommitmentsReportToPDF(reports []entity.CommitmentsReport, filename, outputDir string) (string, error)
+
+	// Full Audit
+	ExportFullAuditReportToCSV(reports []entity.FullAuditReport, filename, outputDir string) ([]string, error)
+	ExportFullAuditReportToJSON(reports []entity.FullAuditReport, filename, outputDir string) (string, error)
+	ExportFullAuditReportToPDF(reports []entity.FullAuditReport, filename, outputDir string) (string, error)
 }
