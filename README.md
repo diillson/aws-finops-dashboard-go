@@ -308,7 +308,12 @@ Para que a ferramenta funcione com todos os recursos, a role ou usuário IAM pre
         "ce:GetReservationUtilization",
         "ce:GetSavingsPlansCoverage",
         "ce:GetSavingsPlansUtilization",
-        "budgets:DescribeBudgets"
+
+        "budgets:ViewBudget",
+        "budgets:DescribeBudgetAction",
+        "budgets:DescribeBudgetActionsForBudget",
+        "budgets:DescribeBudgetActionsForAccount",
+        "budgets:DescribeBudgetActionHistories"
       ],
       "Resource": "*"
     },
@@ -336,12 +341,15 @@ Para que a ferramenta funcione com todos os recursos, a role ou usuário IAM pre
         "s3:ListAllMyBuckets",
         "s3:GetBucketLocation",
         "s3:GetBucketVersioning",
-        "s3:GetBucketLifecycleConfiguration",
-        "s3:ListBucketIntelligentTieringConfigurations",
-        "s3:GetBucketEncryption",
-        "s3:GetPublicAccessBlock",
+
+        "s3:GetLifecycleConfiguration",
+        "s3:GetIntelligentTieringConfiguration",
+        "s3:GetEncryptionConfiguration",
+
         "s3:GetBucketAcl",
-        "s3:GetBucketPolicy"
+        "s3:GetBucketPolicy",
+        "s3:GetBucketPublicAccessBlock",
+        "s3:GetAccountPublicAccessBlock"
       ],
       "Resource": "*"
     },
